@@ -16,6 +16,26 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+
+def load_app_version() -> str:
+    """Read the single version value used by source runs and packaged builds."""
+    roots = []
+    if getattr(sys, "frozen", False):
+        roots.extend((Path(sys.executable).resolve().parent, Path(getattr(sys, "_MEIPASS", ""))))
+    roots.append(PROJECT_ROOT)
+    for root in roots:
+        try:
+            value = (root / "BUILD_VERSION.txt").read_text(encoding="utf-8-sig").strip().lstrip("vV")
+        except OSError:
+            continue
+        if re.fullmatch(r"\d+(?:\.\d+)*", value):
+            return value
+    return "8.1"
+
+
+APP_VERSION = load_app_version()
+APP_TITLE = f"Reg CapCut v{APP_VERSION}"
+
 from core.settings import load_settings, save_settings
 from modules.browser.chromium import ChromiumSession, resolve_chromium_154, parse_browser_proxy
 from modules.actions.capcut_workflow import (
@@ -420,7 +440,7 @@ class RegCapCutApp:
         top = tk.Frame(self.root, bg="#00a884", height=42)
         top.pack(fill="x")
         top.pack_propagate(False)
-        tk.Label(top, text="Reg CapCut v8.1", bg="#00a884", fg="#ffffff", font=("Tahoma", 12, "bold")).pack(side="left", padx=12)
+        tk.Label(top, text=APP_TITLE, bg="#00a884", fg="#ffffff", font=("Tahoma", 12, "bold")).pack(side="left", padx=12)
         tk.Button(
             top,
             text="Settings",
@@ -2654,7 +2674,7 @@ class RegCapCutApp:
 
 def main() -> None:
     root = tk.Tk()
-    root.title("Reg CapCut v8.1")
+    root.title(APP_TITLE)
     root.geometry("1100x700")
     app = RegCapCutApp(root)
     # Persist the Add Link workspace, including per-link usage counts, before exit.

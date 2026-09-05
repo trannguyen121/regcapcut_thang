@@ -27,6 +27,10 @@ không đăng nhập tài khoản CapCut thật.
 
 ## Build
 
+Để tạo bản phát hành mới, chỉ sửa số trong `BUILD_VERSION.txt` (ví dụ `8.1`
+thành `8.2`), sau đó chạy `build_regcapcut_release.bat`. Tên hiển thị trong GUI,
+tên EXE và thư mục trong `dist` sẽ tự dùng cùng số phiên bản.
+
 Các file `.spec` hiện tại cần `core/settings.json` và `cred.json` trên máy.
 Có thể sao chép `cred.example.json` thành `cred.json` để build; muốn ghi Google
 Sheets thì phải cấu hình thông tin service account thật trong file riêng đó.
