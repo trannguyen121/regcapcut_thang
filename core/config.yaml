@@ -1,0 +1,7 @@
+app:
+  name: autopaysafe
+  debug: false
+
+runtime:
+  headless: false
+  retry_times: 3

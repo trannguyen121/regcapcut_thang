@@ -1,0 +1,12 @@
+nuitka>=2.7
+ordered-set>=4.1.0
+zstandard>=0.23.0
+playwright>=1.58.0
+greenlet>=3.0.0
+pyee>=13.0.0
+requests>=2.32.0
+selenium>=4.30.0
+google-auth>=2.40.0
+numpy>=1.26.0
+opencv-python>=4.10.0
+pywinauto>=0.6.9

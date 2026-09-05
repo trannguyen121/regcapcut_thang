@@ -1,0 +1,34 @@
+# Only source and build instructions belong in this repository.
+/*
+!/.gitignore
+!/README.md
+!/requirements.txt
+!/core/
+!/modules/
+!/tests/
+!/tk_ui.py
+!/run.py
+!/run_reg_capcut*.bat
+!/run_reg_grok.bat
+!/build_reg*capcut*.bat
+!/build_reg_capcut*.bat
+!/regcapcut*.spec
+!/regcapcut_build.bat
+!/reggrok.spec
+!/cred.example.json
+
+**/__pycache__/
+*.py[cod]
+*.log
+*.exe
+*.dll
+*.zip
+*.rar
+*.7z
+.env*
+core/*.json
+!core/settings.example.json
+
+# Unrelated PaySafe files contain local login information.
+modules/actions/addpaysafe.py
+modules/ui/paysafe_tool.py

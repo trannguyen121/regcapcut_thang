@@ -1,0 +1,32 @@
+{
+  "gpm": {
+    "api_base_url": "http://127.0.0.1:15288",
+    "profile_url_template": "http://127.0.0.1:15288/api/v3/profiles/{profile_id}",
+    "default_group_id": 1,
+    "default_page": 1,
+    "default_per_page": 50
+  },
+  "capmonster": {
+    "api_base_url": "https://api.capmonster.cloud",
+    "api_key": ""
+  },
+  "thuecloud": {
+    "enabled": false,
+    "api_base_url": "https://api.thuecloud.com",
+    "access_token": "",
+    "proxy_endpoint": "/proxy/dan-cu-xoay-ip/list",
+    "proxy_method": "GET",
+    "proxy_api_key": ""
+  },
+  "browser_window": {
+    "mode": "auto_grid",
+    "scale": 1.0,
+    "screen_width": 1920,
+    "screen_height": 1080,
+    "margin": 12,
+    "gap": 12,
+    "min_width": 480,
+    "min_height": 360
+  },
+  "chromium_path": "chrome-154"
+}
