@@ -46,22 +46,40 @@ class Writer:
         self.current_date = None
         self.log_file = None
         self.ui_buffer = ""
+        self.input_buffer = ""
 
     def write(self, s):
         if not s:
             return
         with self.lock:
-            self.write_file(s)
-            self.write_ui(s)
+            self.input_buffer += s
+            while "\n" in self.input_buffer:
+                line, self.input_buffer = self.input_buffer.split("\n", 1)
+                self._emit_line(line + "\n")
 
     def flush(self):
         with self.lock:
-            if self.log_file:
-                self.log_file.flush()
+            if self.input_buffer:
+                self._emit_line(self.input_buffer)
+                self.input_buffer = ""
             if self.ui_buffer:
                 if self.should_show_ui(self.ui_buffer):
                     self.q.put(self.ui_buffer)
                 self.ui_buffer = ""
+            if self.log_file:
+                self.log_file.flush()
+
+    @staticmethod
+    def timestamp_line(text):
+        """Add one timestamp while preserving the caller's newline."""
+        if not text or not text.strip():
+            return text
+        return f'[{datetime.now().strftime("%H:%M:%S")}] {text}'
+
+    def _emit_line(self, text):
+        timestamped = self.timestamp_line(text)
+        self.write_file(timestamped)
+        self.write_ui(timestamped)
 
     def write_file(self, text):
         try:
