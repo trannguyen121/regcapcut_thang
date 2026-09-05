@@ -111,29 +111,89 @@ class JoinVerificationTests(unittest.TestCase):
         response = SimpleNamespace(
             url="https://www.capcut.com/cc/v1/workspace/get_workspace_info_by_invitation_link",
             request=SimpleNamespace(frame=frame, post_data_json={"invitation_link": self.link}),
-            ok=True,
+            ok=True, status=200,
             json=lambda: {"ret": "0", "data": {"workspace_info": {"workspace_id": "123", "is_member": True}}},
         )
 
-        def expect(predicate, **kwargs):
+        def register_response(_event, callback):
+            self.assertEqual(_event, "response")
+            page.response_callback = callback
+
+        def navigate(*args, **kwargs):
+            predicate = lambda candidate: candidate is response
             self.assertTrue(predicate(response))
             response.url = "https://evil.example/cc/v1/workspace/get_workspace_info_by_invitation_link"
-            self.assertFalse(predicate(response))
+            page.response_callback(response)
             response.url = "https://www.capcut.com/cc/v1/workspace/get_workspace_info_by_invitation_link"
-            response.request.frame = object()
-            self.assertFalse(predicate(response))
-            response.request.frame = frame
-            response.request.post_data_json = {"invitation_link": self.link + "-other"}
-            self.assertFalse(predicate(response))
-            response.request.post_data_json = {"invitation_link": self.link}
-            manager = Mock()
-            manager.__enter__ = Mock(return_value=SimpleNamespace(value=response))
-            manager.__exit__ = Mock(return_value=False)
-            return manager
+            page.response_callback(response)
 
-        page.expect_response.side_effect = expect
+        page.on.side_effect = register_response
+        page.goto.side_effect = navigate
         self.assertEqual(_read_invitation_membership(page, self.link, "test", None), ("123", True))
-        page.goto.assert_called_once()
+        page.goto.assert_called_once_with(
+            self.link, wait_until="commit", timeout=30000,
+        )
+
+    def test_membership_read_survives_invitation_navigation_abort(self):
+        page = Mock()
+        page.url = self.link
+        frame = object()
+        page.main_frame = frame
+        response = SimpleNamespace(
+            url="https://www.capcut.com/cc/v1/workspace/get_workspace_info_by_invitation_link",
+            request=SimpleNamespace(frame=frame, post_data_json={"invitation_link": self.link}),
+            ok=True, status=200,
+            json=lambda: {"ret": "0", "data": {"workspace_info": {
+                "workspace_id": "123", "is_member": True,
+            }}},
+        )
+        page.on.side_effect = lambda _event, callback: setattr(page, "response_callback", callback)
+        def navigate(*args, **kwargs):
+            page.response_callback(response)
+            raise RuntimeError("net::ERR_ABORTED")
+        page.goto.side_effect = navigate
+
+        self.assertEqual(
+            _read_invitation_membership(page, self.link, "test@example.com", None),
+            ("123", True),
+        )
+        page.remove_listener.assert_called_once()
+
+    def test_membership_read_replays_read_only_api_when_cdp_body_is_gone(self):
+        page = Mock()
+        page.url = self.link
+        frame = object()
+        page.main_frame = frame
+        request = SimpleNamespace(
+            frame=frame,
+            post_data_json={"invitation_link": self.link},
+            all_headers=lambda: {
+                ":authority": "www.capcut.com",
+                "cookie": "secret-cookie",
+                "x-csrftoken": "csrf-value",
+            },
+        )
+        response = SimpleNamespace(
+            url="https://www.capcut.com/cc/v1/workspace/get_workspace_info_by_invitation_link",
+            request=request, ok=True, status=200,
+            json=Mock(side_effect=RuntimeError("No resource with given identifier found")),
+        )
+        retry = SimpleNamespace(
+            ok=True, status=200,
+            json=lambda: {"ret": "0", "data": {"workspace_info": {
+                "workspace_id": "123", "is_member": True,
+            }}},
+        )
+        page.context.request.post.return_value = retry
+        page.on.side_effect = lambda _event, callback: setattr(page, "response_callback", callback)
+        page.goto.side_effect = lambda *args, **kwargs: page.response_callback(response)
+
+        self.assertEqual(
+            _read_invitation_membership(page, self.link, "test@example.com", None),
+            ("123", True),
+        )
+        retry_headers = page.context.request.post.call_args.kwargs["headers"]
+        self.assertEqual(retry_headers, {"x-csrftoken": "csrf-value"})
 
 
 if __name__ == "__main__":

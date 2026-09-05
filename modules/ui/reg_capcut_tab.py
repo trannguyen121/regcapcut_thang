@@ -420,7 +420,7 @@ class RegCapCutApp:
         top = tk.Frame(self.root, bg="#00a884", height=42)
         top.pack(fill="x")
         top.pack_propagate(False)
-        tk.Label(top, text="Reg CapCut v6", bg="#00a884", fg="#ffffff", font=("Tahoma", 12, "bold")).pack(side="left", padx=12)
+        tk.Label(top, text="Reg CapCut v8.1", bg="#00a884", fg="#ffffff", font=("Tahoma", 12, "bold")).pack(side="left", padx=12)
         tk.Button(
             top,
             text="Settings",
@@ -492,6 +492,13 @@ class RegCapCutApp:
             "Xuất email|username",
             self.export_registered_usernames,
             "#1d4ed8",
+            "#ffffff",
+        ).pack(side="right", padx=(0, 6))
+        self.tool_button(
+            reg_header,
+            "Xóa tích chọn",
+            self.delete_checked_reg_accounts,
+            "#dc2626",
             "#ffffff",
         ).pack(side="right", padx=(0, 6))
         reg_wrap = tk.Frame(reg_tab, bg="#ffffff", relief="solid", borderwidth=1)
@@ -1625,6 +1632,24 @@ class RegCapCutApp:
         tree.selection_set(children[min(start, end):max(start, end) + 1])
         return "break"
 
+    def delete_checked_reg_accounts(self):
+        task = getattr(self, "task_thread", None)
+        if task and task.is_alive():
+            messagebox.showinfo("Thông báo", "Không thể xóa tài khoản khi tác vụ đang chạy")
+            return
+        checked = [account for account in self.accounts if account.get("picked")]
+        if not checked:
+            messagebox.showinfo("Thông báo", "Hãy tích chọn tài khoản cần xóa")
+            return
+        if not messagebox.askyesno(
+            "Xóa tài khoản",
+            f"Xóa {len(checked)} tài khoản đã tích chọn khỏi bảng Reg CapCut?",
+        ):
+            return
+        self.accounts = [account for account in self.accounts if not account.get("picked")]
+        self.refresh_status()
+        print(f"[REG CAPCUT] Đã xóa {len(checked)} tài khoản đã tích chọn khỏi bảng")
+
     def export_registered_accounts(self):
         selected = [acc for acc in self.accounts if acc.get("picked")]
         if not selected:
@@ -1999,6 +2024,10 @@ class RegCapCutApp:
             if account.get("status") != "true":
                 pending.append(account)
         total = len(pending)
+        print(
+            f"[CAPCUT][ADD LINK][RUN] Starting: accounts={total} | links={len(run_links)} | "
+            f"threads={max_threads} | launch_delay={launch_delay}s"
+        )
         account_index = 0
         link_index = 0
         running = []
@@ -2012,6 +2041,7 @@ class RegCapCutApp:
                 success_count = self.add_link_counts[link]
             in_flight = sum(1 for _, active_link in running if active_link == link)
             if success_count >= 6:
+                print(f"[CAPCUT][ADD LINK][SCHEDULER] Link already full ({success_count}/6), skipping: {link}")
                 link_index += 1
                 continue
             if len(running) >= max_threads or success_count + in_flight >= 6:
@@ -2028,6 +2058,10 @@ class RegCapCutApp:
             account = pending.pop(candidate_index)
             index = account_index
             account_index += 1
+            print(
+                f"[CAPCUT][ADD LINK][SCHEDULER] Assigning {account['user']} -> {link} | "
+                f"count={success_count}/6 | in_flight={in_flight} | pending_accounts={len(pending)}"
+            )
             worker = threading.Thread(
                 target=self.run_add_link_worker,
                 args=(account, link, group_name, index, total, semaphore, max_threads),
@@ -2057,6 +2091,10 @@ class RegCapCutApp:
 
     def run_add_link_worker(self, account, link, group_name, index, total, semaphore, max_threads):
         with semaphore:
+            print(
+                f"[CAPCUT][ADD LINK][WORKER] Started {index + 1}/{total}: "
+                f"{account['user']} -> {link}"
+            )
             history = self._read_add_link_account_state().get(account["user"].casefold(), {})
             if isinstance(history, dict):
                 if history.get("status") == "true":
@@ -2068,6 +2106,10 @@ class RegCapCutApp:
             if account.get("status") == "true" or (
                 account.get("assigned_link") and account["assigned_link"] != link
             ):
+                print(
+                    f"[CAPCUT][ADD LINK][WORKER] Skipped by saved state: {account['user']} | "
+                    f"status={account.get('status', '')} | assigned_link={account.get('assigned_link', '')}"
+                )
                 return
             standalone_process = None
             submit_succeeded = False
@@ -2080,12 +2122,17 @@ class RegCapCutApp:
                 account["assigned_link"] = link
                 account["status"] = "running"
                 self._save_add_link_account_state()
+                print(f"[CAPCUT][ADD LINK][STATE] Saved running assignment: {account['user']} -> {link}")
                 try:
                     self.root.after(0, self.refresh_add_link_status)
                 except RuntimeError:
                     pass
                 standalone_process, result = self._start_account_browser(
                     account, index, max_threads, startup_url=CAPCUT_LOGIN_URL,
+                )
+                print(
+                    f"[CAPCUT][ADD LINK][BROWSER] Chromium ready: {account['user']} | "
+                    f"address={getattr(result, 'remote_debugging_address', 'unknown')}"
                 )
                 workflow_ok = run_capcut_add_link_workflow(
                     account,
@@ -2108,6 +2155,10 @@ class RegCapCutApp:
                     account["status"] = "true"
                     self.add_link_counts[link] = min(6, self.add_link_counts[link] + 1)
                     self.write_add_link_results(lock_held=True)
+                    print(
+                        f"[CAPCUT][ADD LINK][RESULT] Updated link count: "
+                        f"{self.add_link_counts[link]}/6 | {link}"
+                    )
                 try:
                     self.root.after(0, self.refresh_add_link_status)
                 except RuntimeError as exc:
@@ -2159,6 +2210,11 @@ class RegCapCutApp:
                 try:
                     self._save_add_link_account_state()
                     self.append_add_link_account_result(account, submit_succeeded)
+                    print(
+                        f"[CAPCUT][ADD LINK][STATE] Final state saved: {account['user']} | "
+                        f"status={account.get('status', '')} | join_pending={account.get('join_pending', False)} | "
+                        f"result_file={'success' if submit_succeeded else 'fail'}"
+                    )
                     try:
                         self.root.after(0, self.refresh_add_link_status)
                     except RuntimeError:
@@ -2167,6 +2223,7 @@ class RegCapCutApp:
                     with self.active_profiles_lock:
                         self.active_profiles.pop(account["user"], None)
                     self._close_standalone_process(standalone_process)
+                    print(f"[CAPCUT][ADD LINK][BROWSER] Chromium closed: {account['user']}")
 
     def write_add_link_results(self, lock_held=False):
         def write_file():
@@ -2353,6 +2410,20 @@ class RegCapCutApp:
                 if self.stop_event.is_set():
                     self.mark_account_status(account, "stopped")
                     return
+                success_recorded = False
+
+                def on_registered():
+                    nonlocal success_recorded
+                    if success_recorded:
+                        return
+                    success_recorded = True
+                    self.mark_account_status(account, "true")
+                    write_result(account, True, self.export_lock)
+                    self.queue_sheet_success(account)
+                    print(f'Success: {account["user"]}')
+                    if getattr(self, "hold_mode", False):
+                        self._wait_for_hold_profile(result, account["user"])
+
                 workflow_ok = bool(
                     run_capcut_workflow(
                         account,
@@ -2360,6 +2431,7 @@ class RegCapCutApp:
                             "start_result": result,
                             "stop_event": self.stop_event,
                             "on_login_blocked": self._request_expressvpn_reset,
+                            "on_registered": on_registered,
                         },
                     )
                 )
@@ -2367,12 +2439,7 @@ class RegCapCutApp:
                     self.mark_account_status(account, "stopped")
                     return
                 if workflow_ok:
-                    self.mark_account_status(account, "true")
-                    write_result(account, True, self.export_lock)
-                    self.queue_sheet_success(account)
-                    print(f'Success: {account["user"]}')
-                    if getattr(self, "hold_mode", False):
-                        self._wait_for_hold_profile(result, account["user"])
+                    on_registered()
                 else:
                     self.mark_account_status(account, "change fail")
                     write_result(account, False, self.export_lock)
@@ -2463,6 +2530,16 @@ class RegCapCutApp:
             return False
 
     def _wait_for_hold_profile(self, start_result, user):
+        # The owned process is authoritative. A transient CDP error or empty
+        # target list must never trigger worker cleanup and kill a live window.
+        if callable(getattr(start_result, "poll", None)):
+            print(f"[REG TREO] Đang giữ cửa sổ cho {user}; đóng Chromium 154 bằng X để chạy tiếp")
+            while not self.stop_event.is_set() and start_result.poll() is None:
+                self.stop_event.wait(0.5)
+            if not self.stop_event.is_set():
+                print(f"[REG TREO] Chromium đã thoát cho {user}; chờ 3 giây")
+                self.stop_event.wait(3)
+            return
         address = str(getattr(start_result, "remote_debugging_address", "") or getattr(start_result, "browser_location", "") or "")
         match = re.search(r"(?:localhost|127\.0\.0\.1|(?:\d{1,3}\.){3}\d{1,3}):(\d+)", address)
         if not match:
@@ -2577,7 +2654,7 @@ class RegCapCutApp:
 
 def main() -> None:
     root = tk.Tk()
-    root.title("Reg CapCut v6")
+    root.title("Reg CapCut v8.1")
     root.geometry("1100x700")
     app = RegCapCutApp(root)
     # Persist the Add Link workspace, including per-link usage counts, before exit.

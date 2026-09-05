@@ -66,6 +66,7 @@ def _parse_invitation_membership(payload) -> tuple[str, bool]:
 def _read_invitation_membership(page, link: str, user: str, stop_event) -> tuple[str, bool]:
     """Reload this invitation and observe its own authenticated, read-only request."""
     _ensure_running(stop_event, user)
+    print(f"[CAPCUT][ADD LINK][VERIFY] Reading invitation membership: {user} -> {link}")
 
     def is_invitation_response(response):
         try:
@@ -88,20 +89,99 @@ def _read_invitation_membership(page, link: str, user: str, stop_event) -> tuple
         except Exception:
             return False
 
+    captured = {"payload": None, "error": None, "status": None}
+
+    def capture_membership(response):
+        if captured["payload"] is not None or captured["error"] is not None:
+            return
+        if not is_invitation_response(response):
+            return
+        try:
+            captured["status"] = response.status
+            if not response.ok:
+                raise JoinVerificationError(
+                    f"CapCut membership request returned HTTP {response.status}"
+                )
+            try:
+                # Read inside the response callback. The invitation immediately
+                # redirects members and Chromium may otherwise discard this body.
+                captured["payload"] = response.json()
+            except Exception as body_error:
+                # Chromium 154 can still report Network.getResponseBody missing.
+                # Replay only this read-only membership request through the same
+                # authenticated browser context; this never calls the join API.
+                request_body = response.request.post_data_json
+                original_headers = response.request.all_headers()
+                retry_headers = {
+                    name: value
+                    for name, value in original_headers.items()
+                    if not name.startswith(":") and name.casefold() not in {
+                        "cookie", "host", "content-length", "connection",
+                        "accept-encoding",
+                    }
+                }
+                print(
+                    f"[CAPCUT][ADD LINK][VERIFY] Response body unavailable; "
+                    f"retrying read-only membership API: {user} | "
+                    f"{type(body_error).__name__}: {body_error}"
+                )
+                api_response = page.context.request.post(
+                    response.url,
+                    data=request_body,
+                    headers=retry_headers,
+                    timeout=20000,
+                )
+                captured["status"] = api_response.status
+                if not api_response.ok:
+                    raise JoinVerificationError(
+                        f"CapCut membership retry returned HTTP {api_response.status}"
+                    )
+                captured["payload"] = api_response.json()
+                if str(captured["payload"].get("ret")) != "0":
+                    print(
+                        f"[CAPCUT][ADD LINK][VERIFY] Membership API retry rejected: {user} | "
+                        f"ret={captured['payload'].get('ret')} | "
+                        f"message={captured['payload'].get('msg') or captured['payload'].get('message') or ''}"
+                    )
+        except Exception as exc:
+            captured["error"] = exc
+
+    page.on("response", capture_membership)
     try:
-        with page.expect_response(is_invitation_response, timeout=20000) as received:
-            page.goto(link, wait_until="domcontentloaded", timeout=30000)
-        response = received.value
-        _ensure_running(stop_event, user)
-        if not response.ok:
-            raise JoinVerificationError("CapCut membership request returned an HTTP error")
-        return _parse_invitation_membership(response.json())
+        try:
+            page.goto(link, wait_until="commit", timeout=30000)
+        except Exception as navigation_error:
+            print(
+                f"[CAPCUT][ADD LINK][VERIFY] Invitation navigation interrupted; "
+                f"still waiting for membership API: {user} | "
+                f"{type(navigation_error).__name__}: {navigation_error}"
+            )
+        deadline = time.time() + 20.0
+        while captured["payload"] is None and captured["error"] is None and time.time() < deadline:
+            _ensure_running(stop_event, user)
+            page.wait_for_timeout(100)
+        if captured["error"] is not None:
+            raise captured["error"]
+        if captured["payload"] is None:
+            raise JoinVerificationError("Timed out waiting for CapCut membership response")
+        workspace_id, is_member = _parse_invitation_membership(captured["payload"])
+        print(
+            f"[CAPCUT][ADD LINK][VERIFY] Invitation response: {user} | "
+            f"workspace={workspace_id} | is_member={is_member}"
+        )
+        return workspace_id, is_member
     except CapCutWorkflowInterrupted:
         raise
     except JoinVerificationError:
         raise
     except Exception as exc:
-        raise JoinVerificationError(f"Could not verify invitation membership for {user}") from exc
+        detail = str(exc).strip() or repr(exc)
+        raise JoinVerificationError(
+            f"Could not verify invitation membership for {user}: "
+            f"{type(exc).__name__}: {detail}"
+        ) from exc
+    finally:
+        page.remove_listener("response", capture_membership)
 
 
 LOGIN_ERROR_MARKERS = (
@@ -391,6 +471,7 @@ def _login_with_email_once(page, account: dict, stop_event) -> None:
     _ensure_running(stop_event, user)
     print(f"[CAPCUT][LOGIN] Opening login for {user}")
     page.goto(CAPCUT_LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+    print(f"[CAPCUT][ADD LINK][LOGIN] Login page loaded: {user} | url={page.url}")
     accept_capcut_cookies(page, user, stop_event, timeout=2.0)
 
     # CapCut can show either the provider chooser or the email form directly.
@@ -407,6 +488,7 @@ def _login_with_email_once(page, account: dict, stop_event) -> None:
     accept_capcut_cookies(page, user, stop_event, timeout=0.25)
     email_input.wait_for(state="visible", timeout=15000)
     email_input.fill(user)
+    print(f"[CAPCUT][ADD LINK][LOGIN] Email filled; submitting email step: {user}")
     accept_capcut_cookies(page, user, stop_event, timeout=0.1)
     _click_first_visible(
         (
@@ -455,6 +537,7 @@ def _login_with_email_once(page, account: dict, stop_event) -> None:
         )
 
     password_input.fill(password)
+    print(f"[CAPCUT][ADD LINK][LOGIN] Password form ready; submitting login: {user}")
     accept_capcut_cookies(page, user, stop_event, timeout=0.1)
     _click_first_visible(
         (
@@ -504,6 +587,7 @@ def _login_with_email(page, account: dict, stop_event, max_attempts: int = 3) ->
     )
     for attempt in range(1, attempts + 1):
         _ensure_running(stop_event, user)
+        print(f"[CAPCUT][ADD LINK][LOGIN] Attempt {attempt}/{attempts}: {user}")
         try:
             _login_with_email_once(page, account, stop_event)
             return
@@ -534,6 +618,10 @@ def _join_space(page, link: str, user: str, stop_event, *, before_submit=None, p
     _ensure_running(stop_event, user)
     print(f"[CAPCUT][ADD LINK] Opening space link for {user}: {link}")
     workspace_id, is_member = _read_invitation_membership(page, link, user, stop_event)
+    print(
+        f"[CAPCUT][ADD LINK][JOIN] Initial state: {user} | workspace={workspace_id} | "
+        f"is_member={is_member} | previous_submit_pending={pending}"
+    )
     if is_member:
         raise AlreadyJoinedSpaceError(f"Already a member of workspace {workspace_id}: {user}")
     if pending:
@@ -564,6 +652,7 @@ def _join_space(page, link: str, user: str, stop_event, *, before_submit=None, p
             if submit_button is not None:
                 break
         if submit_button is not None:
+            print(f"[CAPCUT][ADD LINK][JOIN] Submit control found and enabled: {user}")
             break
         _wait(0.5, stop_event, user)
     else:
@@ -571,9 +660,11 @@ def _join_space(page, link: str, user: str, stop_event, *, before_submit=None, p
 
     _ensure_running(stop_event, user)
     if before_submit is not None:
+        print(f"[CAPCUT][ADD LINK][JOIN] Persisting pending state before one Submit: {user}")
         before_submit()
     try:
         submit_button.click(timeout=5000)
+        print(f"[CAPCUT][ADD LINK][JOIN] Submit click completed: {user} | workspace={workspace_id}")
     except Exception:
         print(f"[CAPCUT][ADD LINK] Click result uncertain; checking membership without another click: {user}")
     _wait(3.0, stop_event, user)
@@ -585,9 +676,11 @@ def _join_space(page, link: str, user: str, stop_event, *, before_submit=None, p
     # identified before joining; neither My Cloud nor a pending request counts.
     for attempt in range(3):
         _ensure_running(stop_event, user)
+        print(f"[CAPCUT][ADD LINK][VERIFY] Post-submit check {attempt + 1}/3: {user}")
         try:
             confirmed_id, confirmed_member = _read_invitation_membership(page, link, user, stop_event)
-        except JoinVerificationError:
+        except JoinVerificationError as exc:
+            print(f"[CAPCUT][ADD LINK][VERIFY] Check {attempt + 1}/3 failed: {user} | {exc}")
             confirmed_id, confirmed_member = "", False
         if confirmed_id and confirmed_id != workspace_id:
             raise JoinVerificationError(f"Invitation workspace changed during verification for {user}")
@@ -609,9 +702,11 @@ def run_capcut_add_link_workflow(account: dict, link: str, context: dict | None 
     user = account["user"]
     stop_event = (context or {}).get("stop_event")
     cdp_url = _cdp_url(context)
+    print(f"[CAPCUT][ADD LINK][FLOW] Connecting browser: {user} | cdp={cdp_url}")
     with sync_playwright() as playwright:
         browser = _connect_browser(playwright, cdp_url, user, stop_event)
         page = open_workflow_page(browser, context)
+        print(f"[CAPCUT][ADD LINK][FLOW] Browser connected; starting login: {user}")
         _login_with_email(page, account, stop_event)
         # Capture the authenticated CapCut username for the shared Add Link table.
         try:
@@ -620,6 +715,9 @@ def run_capcut_add_link_workflow(account: dict, link: str, context: dict | None 
             )
         except Exception:
             account.setdefault("userID", "")
+            print(f"[CAPCUT][ADD LINK][FLOW] Username could not be read; continuing: {user}")
+        else:
+            print(f"[CAPCUT][ADD LINK][FLOW] Username: {user} | {account.get('userID') or 'not found'}")
         def before_submit():
             account["join_pending"] = True
             persist = (context or {}).get("before_join_submit")
@@ -631,6 +729,7 @@ def run_capcut_add_link_workflow(account: dict, link: str, context: dict | None 
             before_submit=before_submit, pending=bool(account.get("join_pending")),
         )
         account["join_pending"] = False
+        print(f"[CAPCUT][ADD LINK][FLOW] Join workflow verified successfully: {user} -> {link}")
         return True
 
 

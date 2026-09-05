@@ -12,6 +12,52 @@ from modules.ui.reg_capcut_tab import RegCapCutApp
 
 
 class ChromiumSessionTests(unittest.TestCase):
+    def test_delete_checked_reg_accounts_removes_only_checked_rows(self):
+        app = RegCapCutApp.__new__(RegCapCutApp)
+        app.task_thread = None
+        app.accounts = [
+            {"user": "one@example.com", "picked": True},
+            {"user": "two@example.com", "picked": False},
+            {"user": "three@example.com", "picked": True},
+        ]
+        app.refresh_status = Mock()
+        with patch("modules.ui.reg_capcut_tab.messagebox.askyesno", return_value=True):
+            app.delete_checked_reg_accounts()
+        self.assertEqual([account["user"] for account in app.accounts], ["two@example.com"])
+        app.refresh_status.assert_called_once_with()
+
+    def test_delete_checked_reg_accounts_does_nothing_without_checks(self):
+        app = RegCapCutApp.__new__(RegCapCutApp)
+        app.task_thread = None
+        app.accounts = [{"user": "one@example.com", "picked": False}]
+        app.refresh_status = Mock()
+        with patch("modules.ui.reg_capcut_tab.messagebox.showinfo") as info:
+            app.delete_checked_reg_accounts()
+        info.assert_called_once()
+        app.refresh_status.assert_not_called()
+
+    def test_hold_waits_for_process_exit_without_cdp_probe(self):
+        app = RegCapCutApp.__new__(RegCapCutApp)
+        app.stop_event = Mock()
+        app.stop_event.is_set.return_value = False
+        session = Mock()
+        session.poll.side_effect = [None, None, 0]
+        with patch("modules.ui.reg_capcut_tab.urlopen", side_effect=OSError("temporary outage")) as probe:
+            app._wait_for_hold_profile(session, "test")
+        probe.assert_not_called()
+        self.assertEqual(session.poll.call_count, 3)
+        self.assertEqual([call.args[0] for call in app.stop_event.wait.call_args_list], [0.5, 0.5, 3])
+        session.terminate.assert_not_called()
+
+    def test_stop_interrupts_hold_without_waiting_for_process_exit(self):
+        app = RegCapCutApp.__new__(RegCapCutApp)
+        app.stop_event = threading.Event()
+        session = Mock()
+        session.poll.return_value = None
+        with patch.object(app.stop_event, "wait", side_effect=lambda _: app.stop_event.set()):
+            app._wait_for_hold_profile(session, "test")
+        self.assertEqual(session.poll.call_count, 1)
+
     def test_proxy_credentials_are_separate_from_browser_arguments(self):
         for raw in ("host:8080:user:secret", "http://user:secret@host:8080"):
             self.assertEqual(parse_browser_proxy(raw), {

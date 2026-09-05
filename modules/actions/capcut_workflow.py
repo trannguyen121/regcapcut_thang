@@ -754,7 +754,7 @@ def run_capcut_workflow(account: dict | None = None, context: dict | None = None
                         dismiss_popups=dismiss_capcut_onboarding,
                     )
                     print(f"[CAPCUT][RESULT] User for {user}: {account['userID'] or 'not found'}")
-                    return True
+                    break
                 if attempt == 2:
                     return False
                 print(f"[CAPCUT][OTP] Code was rejected for {user}; checking for a newer code")
@@ -782,4 +782,12 @@ def run_capcut_workflow(account: dict | None = None, context: dict | None = None
                     previous_fingerprints,
                     timeout=120.0,
                 )
-        return False
+        else:
+            return False
+        # Keep the CDP connection alive while hold mode waits. Disconnecting
+        # disposes Playwright-owned incognito contexts. Keep persistence/hold
+        # errors outside the OTP retry handler.
+        on_registered = (context or {}).get("on_registered")
+        if on_registered is not None:
+            on_registered()
+        return True
