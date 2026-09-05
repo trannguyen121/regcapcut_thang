@@ -833,6 +833,9 @@ class CapCutAddLinkTests(unittest.TestCase):
             )
 
     def test_account_table_has_clear_add_link_statuses(self):
+        self.assertEqual(RegCapCutApp.CHECKBOX_SELECTED, "\u2611")
+        self.assertEqual(RegCapCutApp.CHECKBOX_UNSELECTED, "\u2610")
+        self.assertNotEqual(RegCapCutApp.CHECKBOX_SELECTED, RegCapCutApp.CHECKBOX_UNSELECTED)
         self.assertEqual(RegCapCutApp._add_link_account_status_text("true"), "Đã add link")
         self.assertEqual(
             RegCapCutApp._add_link_account_status_text("login fail"),

@@ -276,8 +276,10 @@ class RegCapCutWriter:
 
 
 class RegCapCutApp:
-    CHECKBOX_SELECTED = "?"
-    CHECKBOX_UNSELECTED = "?"
+    # Keep these as escapes so Windows consoles, build scripts and source-file
+    # encoding conversions cannot replace the checkbox glyphs with "?".
+    CHECKBOX_SELECTED = "\u2611"
+    CHECKBOX_UNSELECTED = "\u2610"
 
     def __init__(self, root):
         self.root = root
@@ -1214,7 +1216,7 @@ class RegCapCutApp:
 
         body = tk.Frame(self.settings_window, bg="#ffffff", relief="solid", borderwidth=1)
         body.pack(fill="both", expand=True, padx=12, pady=12)
-        tk.Label(body, text="Chromium 154 ?n danh", bg="#ffffff", fg="#111827", font=("Tahoma", 10, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 8))
+        tk.Label(body, text="Chromium 154 ẩn danh", bg="#ffffff", fg="#111827", font=("Tahoma", 10, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 8))
 
         fields = (("expressvpn_path", "ExpressVPN"), ("chromium_path", "Chromium 154"))
         self.settings_entries = {}
@@ -1248,7 +1250,7 @@ class RegCapCutApp:
         try:
             save_settings(self.app_settings)
             self.app_settings = load_settings()
-            print("?? l?u c?i ??t Chromium 154")
+            print("Đã lưu cài đặt Chromium 154")
             self.close_settings_window()
         except Exception as exc:
             messagebox.showerror("Settings", f"Could not save settings: {exc}")
@@ -2390,7 +2392,7 @@ class RegCapCutApp:
             self.active_standalone_processes[str(session.profile_dir)] = session
         if self.stop_event.is_set():
             self._close_standalone_process(session)
-            raise CapCutWorkflowInterrupted("?? d?ng Chromium")
+            raise CapCutWorkflowInterrupted("Đã dừng Chromium")
         return session, session
 
     def _start_account_browser(self, account, index, max_threads, startup_url=CAPCUT_SIGN_UP_URL):
