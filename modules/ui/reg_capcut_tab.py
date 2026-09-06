@@ -37,7 +37,7 @@ APP_VERSION = load_app_version()
 APP_TITLE = f"Reg CapCut v{APP_VERSION}"
 
 from core.settings import load_settings, save_settings
-from modules.browser.chromium import ChromiumSession, resolve_chromium_154, parse_browser_proxy
+from modules.browser.chromium import ChromiumSession, resolve_chromium_152, parse_browser_proxy
 from modules.actions.capcut_workflow import (
     CAPCUT_SIGN_UP_URL,
     CapCutWorkflowInterrupted,
@@ -464,7 +464,7 @@ class RegCapCutApp:
         notebook.add(add_link_tab, text="Thêm link")
         hold_tab = tk.Frame(notebook, bg="#f3f4f7")
         notebook.add(hold_tab, text="Reg CapCut treo")
-        tk.Label(hold_tab, text="Giữ cửa sổ Chromium 154 sau đăng ký; đóng bằng X để chạy tài khoản tiếp theo", bg="#f3f4f7").pack(anchor="w", padx=8, pady=8)
+        tk.Label(hold_tab, text="Giữ cửa sổ Chrome 152 sau đăng ký; đóng bằng X để chạy tài khoản tiếp theo", bg="#f3f4f7").pack(anchor="w", padx=8, pady=8)
         hold_bar = tk.Frame(hold_tab, bg="#ffffff", relief="solid", borderwidth=1)
         hold_bar.pack(fill="x", padx=8, pady=8)
         self.tool_button(hold_bar, "Import Mail", self.import_accounts, "#00a884", "#ffffff").pack(side="left", padx=8, pady=6)
@@ -1261,9 +1261,9 @@ class RegCapCutApp:
 
         body = tk.Frame(self.settings_window, bg="#ffffff", relief="solid", borderwidth=1)
         body.pack(fill="both", expand=True, padx=12, pady=12)
-        tk.Label(body, text="Chromium 154 ẩn danh", bg="#ffffff", fg="#111827", font=("Tahoma", 10, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 8))
+        tk.Label(body, text="Chrome 152 ẩn danh", bg="#ffffff", fg="#111827", font=("Tahoma", 10, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 8))
 
-        fields = (("expressvpn_path", "ExpressVPN"), ("chromium_path", "Chromium 154"))
+        fields = (("expressvpn_path", "ExpressVPN"), ("chromium_path", "Chrome 152"))
         self.settings_entries = {}
         for index, (key, label) in enumerate(fields, start=1):
             tk.Label(body, text=label, bg="#ffffff", fg="#334155").grid(row=index, column=0, sticky="w", padx=10, pady=5)
@@ -1295,7 +1295,7 @@ class RegCapCutApp:
         try:
             save_settings(self.app_settings)
             self.app_settings = load_settings()
-            print("Đã lưu cài đặt Chromium 154")
+            print("Đã lưu cài đặt Chrome 152")
             self.close_settings_window()
         except Exception as exc:
             messagebox.showerror("Settings", f"Could not save settings: {exc}")
@@ -1772,7 +1772,7 @@ class RegCapCutApp:
             try:
                 if self.stop_event.is_set():
                     return
-                username = self._check_user_with_chromium_154(
+                username = self._check_user_with_chrome_152(
                     account,
                     index,
                     max_threads=max_threads,
@@ -1792,7 +1792,7 @@ class RegCapCutApp:
                 except RuntimeError:
                     pass
 
-    def _check_user_with_chromium_154(self, account, index, max_threads=1):
+    def _check_user_with_chrome_152(self, account, index, max_threads=1):
         session = None
         try:
             session, result = self._start_account_browser(
@@ -2151,7 +2151,7 @@ class RegCapCutApp:
                     account, index, max_threads, startup_url=CAPCUT_LOGIN_URL,
                 )
                 print(
-                    f"[CAPCUT][ADD LINK][BROWSER] Chromium ready: {account['user']} | "
+                    f"[CAPCUT][ADD LINK][BROWSER] Chrome 152 ready: {account['user']} | "
                     f"address={getattr(result, 'remote_debugging_address', 'unknown')}"
                 )
                 workflow_ok = run_capcut_add_link_workflow(
@@ -2243,7 +2243,7 @@ class RegCapCutApp:
                     with self.active_profiles_lock:
                         self.active_profiles.pop(account["user"], None)
                     self._close_standalone_process(standalone_process)
-                    print(f"[CAPCUT][ADD LINK][BROWSER] Chromium closed: {account['user']}")
+                    print(f"[CAPCUT][ADD LINK][BROWSER] Chrome 152 closed: {account['user']}")
 
     def write_add_link_results(self, lock_held=False):
         def write_file():
@@ -2310,10 +2310,10 @@ class RegCapCutApp:
             messagebox.showinfo("Info", "Reg CapCut is running")
             return
         try:
-            self._resolve_chromium_154_browser()
+            self._resolve_chromium_152_browser()
         except Exception as exc:
-            messagebox.showerror("Chromium 154", str(exc))
-            print(f"[REG CAPCUT] Chromium preflight failed: {exc}")
+            messagebox.showerror("Chrome 152", str(exc))
+            print(f"[REG CAPCUT] Chrome 152 preflight failed: {exc}")
             return
         self.stop_event.clear()
         self.current_accounts = selected
@@ -2332,9 +2332,9 @@ class RegCapCutApp:
             messagebox.showinfo("Info", "Một tác vụ đang chạy")
             return
         try:
-            self._resolve_chromium_154_browser()
+            self._resolve_chromium_152_browser()
         except RuntimeError as exc:
-            messagebox.showerror("Chromium 154", str(exc))
+            messagebox.showerror("Chrome 152", str(exc))
             return
         try:
             threads = max(1, int(self.threads_entry.get().strip() or "1"))
@@ -2479,8 +2479,8 @@ class RegCapCutApp:
                     self.active_profiles.pop(account["user"], None)
                 self._close_standalone_process(standalone_process)
 
-    def _resolve_chromium_154_browser(self):
-        return resolve_chromium_154(self.app_settings.chromium_path)
+    def _resolve_chromium_152_browser(self):
+        return resolve_chromium_152(self.app_settings.chromium_path)
 
     def _start_standalone_chromium(self, account, index, browser_override=None,
                                    profile_root=None, startup_url=CAPCUT_SIGN_UP_URL,
@@ -2488,7 +2488,7 @@ class RegCapCutApp:
         # profile_root is accepted for compatibility; every session gets a fresh
         # temporary directory, never a reused account/index directory.
         session = ChromiumSession(
-            browser_override or self._resolve_chromium_154_browser(),
+            browser_override or self._resolve_chromium_152_browser(),
             stop_event=self.stop_event, raw_proxy=raw_proxy,
             window_settings=self.app_settings.browser_window,
             index=index % max_threads, total_windows=max_threads,
@@ -2497,7 +2497,7 @@ class RegCapCutApp:
             self.active_standalone_processes[str(session.profile_dir)] = session
         if self.stop_event.is_set():
             self._close_standalone_process(session)
-            raise CapCutWorkflowInterrupted("Đã dừng Chromium")
+            raise CapCutWorkflowInterrupted("Đã dừng Chrome 152")
         return session, session
 
     def _start_account_browser(self, account, index, max_threads, startup_url=CAPCUT_SIGN_UP_URL):
@@ -2553,20 +2553,20 @@ class RegCapCutApp:
         # The owned process is authoritative. A transient CDP error or empty
         # target list must never trigger worker cleanup and kill a live window.
         if callable(getattr(start_result, "poll", None)):
-            print(f"[REG TREO] Đang giữ cửa sổ cho {user}; đóng Chromium 154 bằng X để chạy tiếp")
+            print(f"[REG TREO] Đang giữ cửa sổ cho {user}; đóng Chrome 152 bằng X để chạy tiếp")
             while not self.stop_event.is_set() and start_result.poll() is None:
                 self.stop_event.wait(0.5)
             if not self.stop_event.is_set():
-                print(f"[REG TREO] Chromium đã thoát cho {user}; chờ 3 giây")
+                print(f"[REG TREO] Chrome 152 đã thoát cho {user}; chờ 3 giây")
                 self.stop_event.wait(3)
             return
         address = str(getattr(start_result, "remote_debugging_address", "") or getattr(start_result, "browser_location", "") or "")
         match = re.search(r"(?:localhost|127\.0\.0\.1|(?:\d{1,3}\.){3}\d{1,3}):(\d+)", address)
         if not match:
-            print(f"[REG TREO] Không tìm thấy cổng Chromium 154 để theo dõi: {address}")
+            print(f"[REG TREO] Không tìm thấy cổng Chrome 152 để theo dõi: {address}")
             return
         port = int(match.group(1))
-        print(f"[REG TREO] Đang giữ cửa sổ cho {user}; đóng Chromium 154 bằng X để chạy tiếp")
+        print(f"[REG TREO] Đang giữ cửa sổ cho {user}; đóng Chrome 152 bằng X để chạy tiếp")
         while not self.stop_event.is_set():
             try:
                 with urlopen(f"http://127.0.0.1:{port}/json/list", timeout=1) as response:
@@ -2660,9 +2660,9 @@ class RegCapCutApp:
         for user, process in standalone_to_close:
             try:
                 self._close_standalone_process(process)
-                print(f"Stop closed Chromium: {user}")
+                print(f"Stop closed Chrome 152: {user}")
             except Exception as exc:
-                print(f"Stop Chromium warning for {user}: {exc}")
+                print(f"Stop Chrome 152 warning for {user}: {exc}")
         print("Stop requested")
 
     def drain(self):

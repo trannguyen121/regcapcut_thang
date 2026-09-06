@@ -107,7 +107,7 @@ def _read_invitation_membership(page, link: str, user: str, stop_event) -> tuple
                 # redirects members and Chromium may otherwise discard this body.
                 captured["payload"] = response.json()
             except Exception as body_error:
-                # Chromium 154 can still report Network.getResponseBody missing.
+                # Chrome for Testing can report Network.getResponseBody missing.
                 # Replay only this read-only membership request through the same
                 # authenticated browser context; this never calls the join API.
                 request_body = response.request.post_data_json

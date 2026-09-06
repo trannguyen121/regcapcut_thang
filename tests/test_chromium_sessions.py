@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 
 from playwright.sync_api import sync_playwright
 
-from modules.browser.chromium import ChromiumSession, open_workflow_page, parse_browser_proxy, resolve_chromium_154
+from modules.browser.chromium import ChromiumSession, open_workflow_page, parse_browser_proxy, resolve_chromium_152
 from modules.ui.reg_capcut_tab import RegCapCutApp
 
 
@@ -110,7 +110,7 @@ class ChromiumSessionTests(unittest.TestCase):
         session = Mock()
         account = {"user": "mail"}
         with (
-            patch("tk_ui.resolve_chromium_154", return_value="chrome.exe"),
+            patch("tk_ui.resolve_chromium_152", return_value="chrome.exe"),
             patch("tk_ui.ChromiumSession", return_value=session),
             patch("tk_ui.run_capcut_workflow", return_value=True) as workflow,
         ):
@@ -142,11 +142,11 @@ class ChromiumBrowserTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         try:
-            cls.browser_path = resolve_chromium_154()
+            cls.browser_path = resolve_chromium_152()
         except RuntimeError as exc:
             raise unittest.SkipTest(str(exc))
 
-    def test_real_154_sessions_are_incognito_isolated_and_disposable(self):
+    def test_real_152_sessions_are_incognito_isolated_and_disposable(self):
         first = ChromiumSession(self.browser_path, headless=True)
         second = None
         try:
@@ -156,7 +156,7 @@ class ChromiumBrowserTests(unittest.TestCase):
             with sync_playwright() as p:
                 browser1 = p.chromium.connect_over_cdp("http://" + first.remote_debugging_address)
                 browser2 = p.chromium.connect_over_cdp("http://" + second.remote_debugging_address)
-                self.assertTrue(browser1.version.startswith("154."))
+                self.assertTrue(browser1.version.startswith("152."))
                 page1 = open_workflow_page(browser1, {"start_result": first})
                 page2 = open_workflow_page(browser2, {"start_result": second})
                 for page in (page1, page2):

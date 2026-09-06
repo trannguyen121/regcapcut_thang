@@ -32,7 +32,7 @@ def main() -> int:
     parser.add_argument("--accounts", default="account.txt")
     parser.add_argument(
         "--browser",
-        default="dist/regcapcut_v7.5/chrome-154/chrome.exe",
+        default="dist/chrome-152/chrome.exe",
     )
     parser.add_argument("--passes", type=int, default=2)
     args = parser.parse_args()
@@ -45,7 +45,7 @@ def main() -> int:
         if (account := parse_capcut_login_line(line)) is not None
     ]
     if not browser_path.is_file():
-        raise RuntimeError(f"Chromium not found: {browser_path}")
+        raise RuntimeError(f"Chrome 152 not found: {browser_path}")
 
     app = RegCapCutApp.__new__(RegCapCutApp)
     from core.settings import BrowserWindowSettings
