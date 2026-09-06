@@ -463,7 +463,7 @@ class CapCutAddLinkTests(unittest.TestCase):
         self.assertEqual(app.task_thread.target, app.run_check_user_accounts)
         self.assertTrue(app.task_thread.started)
 
-    def test_check_user_worker_uses_standalone_chrome_152_instead_of_gpm(self):
+    def test_check_user_worker_uses_standalone_chromium_154_instead_of_gpm(self):
         class Process:
             def __init__(self):
                 self.terminated = False
@@ -494,8 +494,8 @@ class CapCutAddLinkTests(unittest.TestCase):
         app._save_add_link_account_state = lambda: None
         app.refresh_add_link_status = lambda: None
         app._request_expressvpn_reset = lambda: None
-        chromium = Path("chrome-152") / "chrome.exe"
-        app._resolve_chromium_152_browser = lambda: chromium
+        chromium = Path("chrome-154") / "chrome.exe"
+        app._resolve_chromium_154_browser = lambda: chromium
         process = Process()
         launches = []
 

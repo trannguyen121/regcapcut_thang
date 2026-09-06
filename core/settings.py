@@ -26,7 +26,7 @@ SETTINGS_FILE = default_settings_file()
 def default_chromium_path() -> str:
     """Return the portable Chrome folder shipped beside the executable."""
     base = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parents[1]
-    return str(base / "chrome-152")
+    return str(base / "chrome-154")
 
 
 @dataclass(slots=True)

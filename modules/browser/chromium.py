@@ -1,4 +1,4 @@
-"""Disposable Chrome 152 processes with an isolated incognito context."""
+"""Disposable Chromium 154 processes with an isolated incognito context."""
 
 import json
 import subprocess
@@ -13,19 +13,19 @@ from urllib.request import urlopen
 from core.settings import resolve_browser_window_layout
 
 
-def resolve_chromium_152(configured=""):
+def resolve_chromium_154(configured=""):
     root = Path(__file__).resolve().parents[2]
     configured = Path(str(configured or "").strip().strip('"'))
     candidates = [
         configured / "chrome.exe" if configured.is_dir() else configured,
-        Path(sys.executable).resolve().parent / "chrome-152" / "chrome.exe",
-        root / "chrome-152" / "chrome.exe",
-        root / "dist" / "chrome-152" / "chrome.exe",
+        Path(sys.executable).resolve().parent / "chrome-154" / "chrome.exe",
+        root / "chrome-154" / "chrome.exe",
+        root / "dist" / "chrome-win" / "chrome.exe",
     ]
     for candidate in candidates:
         if candidate.is_file():
             return candidate.resolve()
-    raise RuntimeError("Không tìm thấy Chrome 152. Chọn chrome.exe hoặc thư mục chrome-152 trong Settings.")
+    raise RuntimeError("Không tìm thấy Chromium 154. Chọn chrome.exe hoặc thư mục chrome-154 trong Settings.")
 
 
 def parse_browser_proxy(raw):
@@ -94,9 +94,9 @@ class ChromiumSession:
             deadline = time.monotonic() + 20
             while time.monotonic() < deadline:
                 if stop_event is not None and stop_event.is_set():
-                    raise RuntimeError("Đã dừng mở Chrome 152")
+                    raise RuntimeError("Đã dừng mở Chromium 154")
                 if self.process.poll() is not None:
-                    raise RuntimeError("Chrome 152 đã thoát trước khi sẵn sàng")
+                    raise RuntimeError("Chromium 154 đã thoát trước khi sẵn sàng")
                 try:
                     port = int((self.profile_dir / "DevToolsActivePort").read_text().splitlines()[0])
                     address = f"127.0.0.1:{port}"
@@ -105,12 +105,12 @@ class ChromiumSession:
                 except (OSError, ValueError, IndexError):
                     time.sleep(0.1)
                     continue
-                if version.split("/")[-1].split(".")[0] != "152":
-                    raise RuntimeError(f"Cần Chrome 152, trình duyệt hiện tại là {version}")
+                if version.split("/")[-1].split(".")[0] != "154":
+                    raise RuntimeError(f"Cần Chromium 154, trình duyệt hiện tại là {version}")
                 self.remote_debugging_address = self.browser_location = address
                 self.success = True
                 return
-            raise RuntimeError("Chrome 152 không mở được cổng điều khiển")
+            raise RuntimeError("Chromium 154 không mở được cổng điều khiển")
         except BaseException:
             self.close()
             raise

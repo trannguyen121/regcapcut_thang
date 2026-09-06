@@ -1,4 +1,4 @@
-from modules.browser.chromium import ChromiumSession, resolve_chromium_152
+from modules.browser.chromium import ChromiumSession, resolve_chromium_154
 import queue
 import sys
 import threading
@@ -1342,7 +1342,7 @@ class App:
                 proxy = self.proxy_for_worker(index, max_threads)
                 if workflow_name == "Reg CapCut":
                     session = ChromiumSession(
-                        resolve_chromium_152(self.app_settings.chromium_path),
+                        resolve_chromium_154(self.app_settings.chromium_path),
                         stop_event=self.stop_event, raw_proxy=self.get_account_raw_proxy(account, proxy),
                         window_settings=self.app_settings.browser_window,
                         index=index % min(max_threads, total), total_windows=min(max_threads, total),

@@ -15,7 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from core.settings import AppSettings, load_settings
-from modules.browser.chromium import ChromiumSession, resolve_chromium_152, parse_browser_proxy
+from modules.browser.chromium import ChromiumSession, resolve_chromium_154, parse_browser_proxy
 from modules.actions.capcut_workflow import (
     CAPCUT_SIGN_UP_URL,
     CapCutWorkflowInterrupted,
@@ -234,7 +234,7 @@ def run_worker(
             proxy = proxy_for_worker(proxies, index, max_threads, total)
             raw_proxy = raw_proxy_for_account(settings, account, proxy)
             session = ChromiumSession(
-                resolve_chromium_152(settings.chromium_path), raw_proxy=raw_proxy,
+                resolve_chromium_154(settings.chromium_path), raw_proxy=raw_proxy,
                 window_settings=settings.browser_window,
                 index=index % min(max_threads, total), total_windows=min(max_threads, total),
             )
@@ -279,7 +279,7 @@ def main() -> int:
         mail_file = (base_dir / args.mail_file).resolve() if not Path(args.mail_file).is_absolute() else Path(args.mail_file)
         proxy_file = (base_dir / args.proxy_file).resolve() if args.proxy_file and not Path(args.proxy_file).is_absolute() else Path(args.proxy_file) if args.proxy_file else None
         settings = load_app_settings(args.chromium_path)
-        resolve_chromium_152(settings.chromium_path)
+        resolve_chromium_154(settings.chromium_path)
         accounts = load_accounts(mail_file, pass_capcut)
         proxies = load_proxies(proxy_file)
         if proxies:

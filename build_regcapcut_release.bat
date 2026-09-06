@@ -33,18 +33,18 @@ if errorlevel 1 (
     exit /b 1
 )
 
-if not exist "dist\chrome-152\chrome.exe" (
+if not exist "dist\chrome-win\chrome.exe" (
     echo.
-    echo ERROR: Khong tim thay dist\chrome-152\chrome.exe
-    echo Ban build da tao xong nhung chua co Chrome 152 de dong goi.
+    echo ERROR: Khong tim thay dist\chrome-win\chrome.exe
+    echo Ban build da tao xong nhung chua co Chromium 154 de dong goi.
     pause
     exit /b 1
 )
 
-echo Copying Chrome 152 into release folder...
-robocopy "dist\chrome-152" "dist\regcapcut_v%REGCAPCUT_VERSION%\chrome-152" /E /NFL /NDL /NJH /NJS /NP >nul
+echo Copying Chromium 154 into release folder...
+robocopy "dist\chrome-win" "dist\regcapcut_v%REGCAPCUT_VERSION%\chrome-154" /E /NFL /NDL /NJH /NJS /NP >nul
 if errorlevel 8 (
-    echo ERROR: Khong the sao chep Chrome 152 vao ban build
+    echo ERROR: Khong the sao chep Chromium 154 vao ban build
     pause
     exit /b 1
 )
