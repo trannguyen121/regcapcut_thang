@@ -455,15 +455,36 @@ def _select_birthday(page, email: str) -> None:
             time.sleep(3.0)
 
 
+def _otp_inputs(page):
+    return page.locator(
+        'input[maxlength="6"], input[autocomplete="one-time-code"], '
+        'input[inputmode="numeric"][maxlength="1"]'
+    )
+
+
+def _otp_is_visible(page) -> bool:
+    fields = _otp_inputs(page)
+    for index in range(fields.count()):
+        if fields.nth(index).is_visible():
+            return True
+    return False
+
+
 def _fill_otp(page, code: str) -> None:
-    otp = page.locator('input[maxlength="6"]').first
-    otp.wait_for(state="visible", timeout=15000)
-    otp.fill(code)
+    fields = _otp_inputs(page)
+    fields.first.wait_for(state="visible", timeout=15000)
+    visible = [fields.nth(index) for index in range(fields.count()) if fields.nth(index).is_visible()]
+    if len(visible) >= len(code) and visible[0].get_attribute("maxlength") == "1":
+        for field, digit in zip(visible, code):
+            field.fill(digit)
+        return
+    visible[0].fill(code)
 
 
 def _wait_for_registration_success(page, user: str, stop_event, timeout: float = 30.0) -> bool:
     deadline = time.time() + timeout
     last_text = ""
+    otp_absent_since = None
     while time.time() <= deadline:
         _ensure_running(stop_event, user)
         try:
@@ -471,8 +492,19 @@ def _wait_for_registration_success(page, user: str, stop_event, timeout: float =
             text = page.locator("body").inner_text(timeout=2000)
             last_text = text[-500:]
             lowered = text.lower()
-            otp_visible = page.locator('input[maxlength="6"]').is_visible()
-            invalid = any(phrase in lowered for phrase in ("invalid code", "incorrect code", "code has expired"))
+            otp_visible = _otp_is_visible(page)
+            invalid = any(
+                phrase in lowered
+                for phrase in (
+                    "invalid code",
+                    "incorrect code",
+                    "code has expired",
+                    "mã không hợp lệ",
+                    "mã không chính xác",
+                    "mã đã hết hạn",
+                    "mã xác minh không đúng",
+                )
+            )
             signed_in_markers = (
                 "which of the following roles best describes you?",
                 "get started with space",
@@ -483,10 +515,17 @@ def _wait_for_registration_success(page, user: str, stop_event, timeout: float =
             )
             if invalid:
                 return False
+            if otp_visible:
+                otp_absent_since = None
+            elif otp_absent_since is None:
+                otp_absent_since = time.time()
             if not otp_visible and (
                 "/signup" not in url or any(marker in lowered for marker in signed_in_markers)
             ):
                 print(f"[CAPCUT][RESULT] Registration completed for {user}: {page.url}")
+                return True
+            if otp_absent_since is not None and time.time() - otp_absent_since >= 2.0:
+                print(f"[CAPCUT][RESULT] OTP form closed; registration completed for {user}: {page.url}")
                 return True
         except Exception:
             pass
@@ -730,7 +769,7 @@ def run_capcut_workflow(account: dict | None = None, context: dict | None = None
             raise RuntimeError(f"CapCut birthday form is incomplete for {user}")
         continue_button.click(timeout=10000)
 
-        page.locator('input[maxlength="6"]').wait_for(state="visible", timeout=30000)
+        _otp_inputs(page).first.wait_for(state="visible", timeout=30000)
         used_codes: set[str] = set()
         resent_code = None
         for attempt in range(3):
@@ -777,7 +816,8 @@ def run_capcut_workflow(account: dict | None = None, context: dict | None = None
                 if attempt == 2:
                     return False
                 print(f"[CAPCUT][OTP] Code was rejected for {user}; checking for a newer code")
-                page.locator('input[maxlength="6"]').first.fill("")
+                if _otp_is_visible(page):
+                    _otp_inputs(page).first.fill("")
                 previous_fingerprints = _capcut_message_fingerprints(_get_messages(account))
                 _resend_capcut_code(page, user, stop_event)
                 resent_code = _wait_for_resent_capcut_code(
@@ -792,7 +832,8 @@ def run_capcut_workflow(account: dict | None = None, context: dict | None = None
                 if attempt == 2:
                     raise
                 print(f"[CAPCUT][OTP] Code was not accepted for {user}; checking for a newer code")
-                page.locator('input[maxlength="6"]').first.fill("")
+                if _otp_is_visible(page):
+                    _otp_inputs(page).first.fill("")
                 previous_fingerprints = _capcut_message_fingerprints(_get_messages(account))
                 _resend_capcut_code(page, user, stop_event)
                 resent_code = _wait_for_resent_capcut_code(
