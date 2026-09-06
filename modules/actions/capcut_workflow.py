@@ -669,7 +669,6 @@ def run_capcut_workflow(account: dict | None = None, context: dict | None = None
         else:
             raise RuntimeError(f"CapCut signup page did not load after 3 retries for {user}: {last_navigation_error}")
         accept_capcut_cookies(page, user, stop_event, timeout=2.0)
-        continue_email = page.get_by_text("Continue with email", exact=True)
         accept_capcut_cookies(page, user, stop_event, timeout=0.25)
         email_input = page.locator('input[name="username"]')
         last_error = None
@@ -678,34 +677,48 @@ def run_capcut_workflow(account: dict | None = None, context: dict | None = None
                 accept_capcut_cookies(page, user, stop_event, timeout=1.0)
                 if email_input.is_visible():
                     break
-                if not continue_email.is_visible():
-                    page.wait_for_timeout(1500)
-                try:
-                    continue_email.click(timeout=12000)
-                except Exception:
-                    page.get_by_role("button", name=re.compile(r"continue with email", re.IGNORECASE)).click(timeout=12000)
+                # CapCut first renders an English login component, then may
+                # replace it with a localized component using different CSS.
+                # Resolve the current element for every attempt so Playwright
+                # never clicks a detached element from the first render.
+                continue_email = page.get_by_text(
+                    re.compile(r"^(Continue with email|Tiếp tục bằng email)$", re.I),
+                    exact=True,
+                ).first
+                continue_email.wait_for(state="visible", timeout=12000)
+                continue_email.locator("..").click(timeout=12000)
                 email_input.wait_for(state="visible", timeout=20000)
                 break
             except Exception as exc:
                 last_error = exc
-                print(f"[CAPCUT][SIGNUP] Retry {attempt}/4 waiting for email form: {user}")
+                error_text = str(exc).replace("\n", " ")[:500]
+                print(
+                    f"[CAPCUT][SIGNUP] Retry {attempt}/4 waiting for email form: {user}"
+                    f" | url={page.url} | {type(exc).__name__}: {error_text}"
+                )
                 if attempt < 4:
-                    time.sleep(5.0)
+                    _wait(5.0, stop_event, user)
         else:
             raise RuntimeError(f"CapCut email form did not appear after 4 retries for {user}: {last_error}")
         email_input.fill(user)
         accept_capcut_cookies(page, user, stop_event, timeout=0.1)
-        page.get_by_role("button", name="Continue", exact=True).click(timeout=10000)
+        page.get_by_role("button", name="Continue", exact=True).or_(
+            page.get_by_role("button", name="Tiếp tục", exact=True)
+        ).click(timeout=10000)
 
         password_input = page.locator('input[name="password"]')
         password_input.wait_for(state="visible", timeout=30000)
         password_input.fill(account["passnew"])
         accept_capcut_cookies(page, user, stop_event, timeout=0.1)
-        page.get_by_role("button", name="Sign up", exact=True).click(timeout=10000)
+        page.get_by_role("button", name="Sign up", exact=True).or_(
+            page.get_by_role("button", name="Đăng ký", exact=True)
+        ).click(timeout=10000)
 
         page.locator('input[placeholder="Year"]').wait_for(state="visible", timeout=30000)
         _select_birthday(page, user)
-        continue_button = page.get_by_role("button", name="Continue", exact=True)
+        continue_button = page.get_by_role("button", name="Continue", exact=True).or_(
+            page.get_by_role("button", name="Tiếp tục", exact=True)
+        )
         continue_button.wait_for(state="visible", timeout=5000)
         if not continue_button.is_enabled():
             raise RuntimeError(f"CapCut birthday form is incomplete for {user}")
