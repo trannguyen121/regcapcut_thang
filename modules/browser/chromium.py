@@ -71,9 +71,15 @@ class ChromiumSession:
         self.profile_dir = Path(self._temp.name).resolve()
         self.process = None
         self._closed = False
-        args = [str(browser), "--remote-debugging-address=127.0.0.1", "--remote-debugging-port=0",
-                f"--user-data-dir={self.profile_dir}", "--incognito", "--no-first-run",
-                "--no-default-browser-check", "--disable-background-mode"]
+        # Keep Chrome's normal defaults. Only isolation, incognito and the CDP
+        # endpoint required by the workflow are always enabled.
+        args = [
+            str(browser),
+            "--remote-debugging-address=127.0.0.1",
+            "--remote-debugging-port=0",
+            f"--user-data-dir={self.profile_dir}",
+            "--incognito",
+        ]
         if headless:
             args.append("--headless=new")
         if self.proxy:
@@ -88,9 +94,9 @@ class ChromiumSession:
             deadline = time.monotonic() + 20
             while time.monotonic() < deadline:
                 if stop_event is not None and stop_event.is_set():
-                    raise RuntimeError("Đã dừng mở Chromium")
+                    raise RuntimeError("Đã dừng mở Chrome 152")
                 if self.process.poll() is not None:
-                    raise RuntimeError("Chromium đã thoát trước khi sẵn sàng")
+                    raise RuntimeError("Chrome 152 đã thoát trước khi sẵn sàng")
                 try:
                     port = int((self.profile_dir / "DevToolsActivePort").read_text().splitlines()[0])
                     address = f"127.0.0.1:{port}"
@@ -104,7 +110,7 @@ class ChromiumSession:
                 self.remote_debugging_address = self.browser_location = address
                 self.success = True
                 return
-            raise RuntimeError("Chromium không mở được cổng điều khiển")
+            raise RuntimeError("Chrome 152 không mở được cổng điều khiển")
         except BaseException:
             self.close()
             raise
@@ -134,7 +140,7 @@ class ChromiumSession:
                     self.process.wait(timeout=5)
             # Only remove the unique directory allocated by TemporaryDirectory.
             if Path(self._temp.name).resolve() != self.profile_dir or self.profile_dir.parent != Path(tempfile.gettempdir()).resolve():
-                raise RuntimeError("Unexpected Chromium temporary directory")
+                raise RuntimeError("Unexpected Chrome temporary directory")
             # Windows may hold cache handles briefly after the process tree exits.
             for attempt in range(30):
                 try:
