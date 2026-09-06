@@ -435,16 +435,18 @@ def _birthday_for(email: str) -> tuple[str, str, str]:
 
 def _select_birthday(page, email: str) -> None:
     year, month, day = _birthday_for(email)
+    month_index = MONTH_NAMES.index(month)
+    year_input = page.locator('input[placeholder="Year"], input[placeholder="Năm"]').first
+    month_input = page.locator('input[placeholder="Month"], input[placeholder="Tháng"]').first
+    day_input = page.locator('input[placeholder="Day"], input[placeholder="Ngày"]').first
     for attempt in range(1, 4):
         try:
             accept_capcut_cookies(page, email, None, timeout=1.0)
-            page.locator('input[placeholder="Year"]').fill(year)
-            month_input = page.locator('input[placeholder="Month"]')
+            year_input.fill(year)
             month_input.locator("..").click(timeout=7000)
-            page.get_by_text(month, exact=True).last.click(timeout=7000)
-            day_input = page.locator('input[placeholder="Day"]')
+            page.get_by_role("option").nth(month_index).click(timeout=7000)
             day_input.locator("..").click(timeout=7000)
-            page.get_by_text(day, exact=True).last.click(timeout=7000)
+            page.get_by_role("option", name=day, exact=True).last.click(timeout=7000)
             return
         except Exception:
             if attempt >= 3:
@@ -714,7 +716,11 @@ def run_capcut_workflow(account: dict | None = None, context: dict | None = None
             page.get_by_role("button", name="Đăng ký", exact=True)
         ).click(timeout=10000)
 
-        page.locator('input[placeholder="Year"]').wait_for(state="visible", timeout=30000)
+        birthday_year = page.locator(
+            'input[placeholder="Year"], input[placeholder="Năm"]'
+        ).first
+        birthday_year.wait_for(state="visible", timeout=30000)
+        print(f"[CAPCUT][SIGNUP] Birthday form ready: {user} | url={page.url}")
         _select_birthday(page, user)
         continue_button = page.get_by_role("button", name="Continue", exact=True).or_(
             page.get_by_role("button", name="Tiếp tục", exact=True)
