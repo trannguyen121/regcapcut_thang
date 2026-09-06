@@ -12,6 +12,18 @@ from modules.ui.reg_capcut_tab import RegCapCutApp
 
 
 class ChromiumSessionTests(unittest.TestCase):
+    def test_hold_reuses_startup_incognito_context_for_new_tabs(self):
+        page = Mock()
+        startup_context = Mock()
+        startup_context.pages = [page]
+        browser = Mock()
+        browser.contexts = [startup_context]
+        session = SimpleNamespace(reuse_startup_context=True, proxy=None)
+
+        self.assertIs(open_workflow_page(browser, {"start_result": session}), page)
+        browser.new_context.assert_not_called()
+        startup_context.new_page.assert_not_called()
+
     def test_delete_checked_reg_accounts_removes_only_checked_rows(self):
         app = RegCapCutApp.__new__(RegCapCutApp)
         app.task_thread = None

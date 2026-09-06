@@ -28,6 +28,22 @@ def resolve_chromium_154(configured=""):
     raise RuntimeError("Không tìm thấy Chromium 154. Chọn chrome.exe hoặc thư mục chrome-154 trong Settings.")
 
 
+def resolve_installed_chrome():
+    """Return the Google Chrome installed on this Windows machine."""
+    if sys.platform != "win32":
+        raise RuntimeError("Reg treo dùng Chrome cài trên máy hiện chỉ hỗ trợ Windows")
+    import os
+    candidates = (
+        Path(os.environ.get("PROGRAMFILES", "")) / "Google" / "Chrome" / "Application" / "chrome.exe",
+        Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Google" / "Chrome" / "Application" / "chrome.exe",
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Google" / "Chrome" / "Application" / "chrome.exe",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate.resolve()
+    raise RuntimeError("Không tìm thấy Google Chrome đã cài trên máy")
+
+
 def parse_browser_proxy(raw):
     raw = str(raw or "").strip()
     if not raw:
@@ -62,9 +78,11 @@ def parse_browser_proxy(raw):
 
 class ChromiumSession:
     def __init__(self, browser, *, stop_event=None, raw_proxy="", window_settings=None,
-                 index=0, total_windows=1, headless=False):
+                 index=0, total_windows=1, headless=False, expected_major="154",
+                 reuse_startup_context=False):
         self.proxy = parse_browser_proxy(raw_proxy)
         self.incognito = True
+        self.reuse_startup_context = bool(reuse_startup_context)
         self.success = False
         self._lock = threading.RLock()
         self._temp = tempfile.TemporaryDirectory(prefix="capcut-chromium-")
@@ -105,8 +123,10 @@ class ChromiumSession:
                 except (OSError, ValueError, IndexError):
                     time.sleep(0.1)
                     continue
-                if version.split("/")[-1].split(".")[0] != "154":
-                    raise RuntimeError(f"Cần Chromium 154, trình duyệt hiện tại là {version}")
+                actual_major = version.split("/")[-1].split(".")[0]
+                if expected_major is not None and actual_major != str(expected_major):
+                    raise RuntimeError(f"Cần Chromium {expected_major}, trình duyệt hiện tại là {version}")
+                self.browser_version = version
                 self.remote_debugging_address = self.browser_location = address
                 self.success = True
                 return
@@ -158,6 +178,18 @@ class ChromiumSession:
 
 def open_workflow_page(browser, context):
     session = (context or {}).get("start_result")
+    if getattr(session, "reuse_startup_context", False):
+        if session.proxy and session.proxy.get("username"):
+            raise RuntimeError(
+                "Reg treo dùng Chrome hệ thống không hỗ trợ proxy có username/password"
+            )
+        browser_context = next(
+            (candidate for candidate in browser.contexts if candidate.pages),
+            browser.contexts[0] if browser.contexts else None,
+        )
+        if browser_context is None:
+            raise RuntimeError("Không tìm thấy context ẩn danh khởi động của Chrome")
+        return browser_context.pages[0] if browser_context.pages else browser_context.new_page()
     if getattr(session, "incognito", False):
         options = {"no_viewport": True}
         if session.proxy:

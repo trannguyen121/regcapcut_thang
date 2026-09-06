@@ -37,7 +37,7 @@ APP_VERSION = load_app_version()
 APP_TITLE = f"Reg CapCut v{APP_VERSION}"
 
 from core.settings import load_settings, save_settings
-from modules.browser.chromium import ChromiumSession, resolve_chromium_154, parse_browser_proxy
+from modules.browser.chromium import ChromiumSession, resolve_chromium_154, resolve_installed_chrome, parse_browser_proxy
 from modules.actions.capcut_workflow import (
     CAPCUT_SIGN_UP_URL,
     CapCutWorkflowInterrupted,
@@ -464,7 +464,7 @@ class RegCapCutApp:
         notebook.add(add_link_tab, text="Thêm link")
         hold_tab = tk.Frame(notebook, bg="#f3f4f7")
         notebook.add(hold_tab, text="Reg CapCut treo")
-        tk.Label(hold_tab, text="Giữ cửa sổ Chromium 154 sau đăng ký; đóng bằng X để chạy tài khoản tiếp theo", bg="#f3f4f7").pack(anchor="w", padx=8, pady=8)
+        tk.Label(hold_tab, text="Dùng Chrome cài trên máy ở chế độ ẩn danh; tab mở thêm dùng chung phiên đăng nhập", bg="#f3f4f7").pack(anchor="w", padx=8, pady=8)
         hold_bar = tk.Frame(hold_tab, bg="#ffffff", relief="solid", borderwidth=1)
         hold_bar.pack(fill="x", padx=8, pady=8)
         self.tool_button(hold_bar, "Import Mail", self.import_accounts, "#00a884", "#ffffff").pack(side="left", padx=8, pady=6)
@@ -2332,9 +2332,9 @@ class RegCapCutApp:
             messagebox.showinfo("Info", "Một tác vụ đang chạy")
             return
         try:
-            self._resolve_chromium_154_browser()
+            resolve_installed_chrome()
         except RuntimeError as exc:
-            messagebox.showerror("Chromium 154", str(exc))
+            messagebox.showerror("Google Chrome", str(exc))
             return
         try:
             threads = max(1, int(self.threads_entry.get().strip() or "1"))
@@ -2484,7 +2484,8 @@ class RegCapCutApp:
 
     def _start_standalone_chromium(self, account, index, browser_override=None,
                                    profile_root=None, startup_url=CAPCUT_SIGN_UP_URL,
-                                   raw_proxy="", max_threads=1):
+                                   raw_proxy="", max_threads=1, expected_major="154",
+                                   reuse_startup_context=False):
         # profile_root is accepted for compatibility; every session gets a fresh
         # temporary directory, never a reused account/index directory.
         session = ChromiumSession(
@@ -2492,6 +2493,8 @@ class RegCapCutApp:
             stop_event=self.stop_event, raw_proxy=raw_proxy,
             window_settings=self.app_settings.browser_window,
             index=index % max_threads, total_windows=max_threads,
+            expected_major=expected_major,
+            reuse_startup_context=reuse_startup_context,
         )
         with self.active_profiles_lock:
             self.active_standalone_processes[str(session.profile_dir)] = session
@@ -2503,6 +2506,16 @@ class RegCapCutApp:
     def _start_account_browser(self, account, index, max_threads, startup_url=CAPCUT_SIGN_UP_URL):
         proxy = self.proxy_for_worker(index, max_threads)
         raw_proxy = self.get_account_raw_proxy(account, proxy)
+        if getattr(self, "hold_mode", False):
+            return self._start_standalone_chromium(
+                account,
+                index,
+                browser_override=resolve_installed_chrome(),
+                raw_proxy=raw_proxy,
+                max_threads=max_threads,
+                expected_major=None,
+                reuse_startup_context=True,
+            )
         return self._start_standalone_chromium(
             account, index, raw_proxy=raw_proxy, max_threads=max_threads,
             startup_url=startup_url,
