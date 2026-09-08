@@ -4,10 +4,11 @@ import threading
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from modules.actions.capcut_add_link import (
     AlreadyJoinedSpaceError,
+    CapCutLoginError,
     JoinVerificationError,
     _cant_join_space_visible,
     _cant_submit_request_visible,
@@ -127,6 +128,58 @@ class CapCutAddLinkTests(unittest.TestCase):
             with patch("modules.ui.reg_capcut_tab.run_capcut_add_link_workflow", return_value=True) as workflow:
                 app.run_add_link_accounts(max_threads=1, launch_delay=0)
                 workflow.assert_called_once()
+
+    def test_failed_login_can_use_another_link_after_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            account = {"user": "mail@example.com", "passnew": "pass"}
+            app = self._make_add_link_app(directory, [account])
+            with patch("modules.ui.reg_capcut_tab.run_capcut_add_link_workflow",
+                       side_effect=CapCutLoginError("try again later")):
+                app.run_add_link_accounts(max_threads=1, launch_delay=0)
+            self.assertEqual(account["status"], "login fail")
+            self.assertFalse(app._read_add_link_account_state()[account["user"]]["assigned_link"])
+
+            # Reproduce old releases that persisted the failed login's link.
+            state = app._read_add_link_account_state()
+            state[account["user"]]["assigned_link"] = "https://space-a"
+            app.add_link_account_state_path.write_text(json.dumps(state), encoding="utf-8")
+            app.add_link_accounts_path.write_text("mail@example.com|pass\n", encoding="utf-8")
+            app.load_add_link_accounts()
+            app.add_link_counts["https://space-a"] = 6
+            app.add_link_selected = {"https://space-b"}
+            app.add_link_threads_entry = types.SimpleNamespace(get=lambda: "1")
+            app.add_link_delay_entry = types.SimpleNamespace(get=lambda: "0")
+            app._save_add_link_workspace = lambda: None
+
+            def workflow(account, link, context):
+                self.assertEqual(link, "https://space-b")
+                saved = app._read_add_link_account_state()[account["user"]]
+                self.assertEqual(saved["assigned_link"], link)
+                return True
+
+            with patch("modules.ui.reg_capcut_tab.run_capcut_add_link_workflow", side_effect=workflow) as run:
+                app.start_add_link()
+                worker = app.task_thread
+                if worker is not None:
+                    worker.join(timeout=5)
+                    self.assertFalse(worker.is_alive())
+                run.assert_called_once()
+            self.assertEqual(app.add_link_accounts[0]["status"], "true")
+            self.assertEqual(app.add_link_counts, {"https://space-a": 6, "https://space-b": 1})
+
+    def test_login_failure_with_pending_submit_keeps_original_link(self):
+        with tempfile.TemporaryDirectory() as directory:
+            account = {"user": "mail@example.com", "passnew": "pass",
+                       "status": "login fail", "join_pending": True,
+                       "assigned_link": "https://space-a"}
+            app = self._make_add_link_app(directory, [account])
+            app._save_add_link_account_state()
+            app.add_link_run_links = ["https://space-b"]
+            with patch("modules.ui.reg_capcut_tab.run_capcut_add_link_workflow") as run:
+                app.run_add_link_accounts(max_threads=1, launch_delay=0)
+                run.assert_not_called()
+            self.assertEqual(app._read_add_link_account_state()[account["user"]]["assigned_link"],
+                             "https://space-a")
 
     def test_deleted_account_keeps_history_when_imported_again(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -355,6 +408,22 @@ class CapCutAddLinkTests(unittest.TestCase):
         self.assertEqual(login_once.call_count, 2)
         self.assertEqual(page.urls, ["about:blank"])
 
+    def test_rate_limited_login_uses_long_backoff_and_clears_cookies(self):
+        page = Mock()
+        waits = []
+        account = {"user": "limited@example.com", "passnew": "pass"}
+        with (
+            patch(
+                "modules.actions.capcut_add_link._login_with_email_once",
+                side_effect=[CapCutLoginError("try again later"), None],
+            ),
+            patch("modules.actions.capcut_add_link._wait", side_effect=lambda seconds, *_: waits.append(seconds)),
+        ):
+            _login_with_email(page, account, None, max_attempts=3)
+
+        page.context.clear_cookies.assert_called_once_with()
+        self.assertEqual(waits, [15.0])
+
     def test_success_requires_pro_teams_membership(self):
         self.assertTrue(_pro_plan_visible(_Page("Pro\nYou're enjoying Pro benefits as a\nTeams member")))
         self.assertFalse(_pro_plan_visible(_Page("Joined successfully")))
@@ -520,6 +589,76 @@ class CapCutAddLinkTests(unittest.TestCase):
         self.assertEqual(launches[0]["startup_url"], "https://www.capcut.com/login")
         self.assertTrue(process.terminated)
 
+    def test_login_hold_uses_selected_manage_capcut_accounts(self):
+        class Entry:
+            def get(self):
+                return "2"
+
+        class Thread:
+            def __init__(self, target, args, daemon):
+                self.target = target
+                self.args = args
+                self.daemon = daemon
+                self.started = False
+
+            def start(self):
+                self.started = True
+
+            def is_alive(self):
+                return False
+
+        app = RegCapCutApp.__new__(RegCapCutApp)
+        app.accounts = [{"user": "reg@example.com", "picked": False}]
+        app.add_link_accounts = [
+            {"user": "selected@example.com", "passnew": "pass"},
+            {"user": "skipped@example.com", "passnew": "pass"},
+        ]
+        app.add_link_account_selected = {"selected@example.com"}
+        app.add_link_threads_entry = Entry()
+        app.task_thread = None
+        app.stop_event = threading.Event()
+
+        with (
+            patch("modules.ui.reg_capcut_tab.resolve_installed_chrome", return_value=Path("chrome.exe")),
+            patch("modules.ui.reg_capcut_tab.threading.Thread", Thread),
+        ):
+            app.start_hold_mode()
+
+        self.assertEqual(app.current_accounts, [app.add_link_accounts[0]])
+        self.assertEqual(app.task_thread.target, app.run_hold_accounts)
+        self.assertEqual(app.task_thread.args, ([app.add_link_accounts[0]], 2))
+        self.assertTrue(app.task_thread.started)
+
+    def test_login_hold_worker_opens_login_and_waits_for_browser_close(self):
+        app = RegCapCutApp.__new__(RegCapCutApp)
+        app.stop_event = threading.Event()
+        session = Mock()
+        result = Mock()
+        launches = []
+        waited = []
+        closed = []
+        account = {"user": "selected@example.com", "passnew": "pass"}
+
+        def start_browser(target, index, max_threads, **kwargs):
+            launches.append((target, index, max_threads, kwargs))
+            return session, result
+
+        app._start_account_browser = start_browser
+        app._wait_for_hold_profile = lambda target, user: waited.append((target, user))
+        app._close_standalone_process = lambda target: closed.append(target)
+
+        def login_hold(target, context):
+            self.assertIs(target, account)
+            context["on_logged_in"]()
+            return True
+
+        with patch("modules.ui.reg_capcut_tab.run_capcut_login_hold_workflow", side_effect=login_hold):
+            app.run_hold_login_worker(account, 0, threading.Semaphore(1), 2)
+
+        self.assertEqual(launches[0][3]["startup_url"], "https://www.capcut.com/login")
+        self.assertEqual(waited, [(result, "selected@example.com")])
+        self.assertEqual(closed, [session])
+
     def test_successful_registration_keeps_username_from_chromium_workflow(self):
         app = RegCapCutApp.__new__(RegCapCutApp)
         app.stop_event = threading.Event()
@@ -633,11 +772,11 @@ class CapCutAddLinkTests(unittest.TestCase):
 
             self.assertEqual(
                 state["done@example.com"],
-                {"status": "true", "pro_status": "", "userID": "", "assigned_link": "", "join_pending": False, "selected": True},
+                {"status": "true", "pro_status": "", "space_status": "", "userID": "", "assigned_link": "", "join_pending": False, "selected": True},
             )
             self.assertEqual(
                 state["fail@example.com"],
-                {"status": "login fail", "pro_status": "", "userID": "", "assigned_link": "", "join_pending": False, "selected": False},
+                {"status": "login fail", "pro_status": "", "space_status": "", "userID": "", "assigned_link": "", "join_pending": False, "selected": False},
             )
 
     def test_import_restores_saved_add_link_status_and_checkboxes(self):
@@ -845,6 +984,14 @@ class CapCutAddLinkTests(unittest.TestCase):
         self.assertEqual(RegCapCutApp._check_pro_status_text("true"), "Có CapCut Pro")
         self.assertEqual(RegCapCutApp._check_pro_status_text("false"), "Không có CapCut Pro")
         self.assertEqual(RegCapCutApp._check_pro_status_text(""), "Chưa kiểm tra")
+
+    def test_capcut_status_prefers_check_space_result(self):
+        account = {"pro_status": "true", "space_status": "Đã xác minh còn 1 space Teams; đã rời 0"}
+        self.assertEqual(
+            RegCapCutApp._capcut_status_text(account),
+            "Đã xác minh còn 1 space Teams; đã rời 0",
+        )
+        self.assertEqual(RegCapCutApp._capcut_status_text({"pro_status": "true"}), "Có CapCut Pro")
 
     def test_ctrl_a_highlights_every_row_in_any_table(self):
         class FakeTree:

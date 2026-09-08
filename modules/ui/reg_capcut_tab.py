@@ -53,10 +53,19 @@ from modules.actions.capcut_add_link import (
     run_capcut_add_link_workflow,
     run_capcut_check_pro_workflow,
     run_capcut_check_user_workflow,
+    run_capcut_login_hold_workflow,
 )
 from modules.proxy.thuecloud import ThueCloudClient, parse_static_proxy_line, reset_change_ip_url
 from modules.proxy.expressvpn import ExpressVPNController, ExpressVPNError
 from modules.storage.google_sheets import append_success_rows
+from modules.ui.capcut_space_check import CheckSpaceMixin
+
+
+def _add_link_assignment(account: dict) -> str:
+    """A failed login without a pending Submit has not used its invitation."""
+    if account.get("status") == "login fail" and not account.get("join_pending"):
+        return ""
+    return account.get("assigned_link") or ""
 
 
 def build_tab(app) -> None:
@@ -313,7 +322,7 @@ class RegCapCutWriter:
         return not any(pattern in stripped for pattern in self.HIDDEN_UI_PATTERNS)
 
 
-class RegCapCutApp:
+class RegCapCutApp(CheckSpaceMixin):
     # Keep these as escapes so Windows consoles, build scripts and source-file
     # encoding conversions cannot replace the checkbox glyphs with "?".
     CHECKBOX_SELECTED = "\u2611"
@@ -461,18 +470,7 @@ class RegCapCutApp:
         reg_tab = tk.Frame(notebook, bg="#f3f4f7")
         add_link_tab = tk.Frame(notebook, bg="#f3f4f7")
         notebook.add(reg_tab, text="Đăng ký CapCut")
-        notebook.add(add_link_tab, text="Thêm link")
-        hold_tab = tk.Frame(notebook, bg="#f3f4f7")
-        notebook.add(hold_tab, text="Reg CapCut treo")
-        tk.Label(hold_tab, text="Dùng Chrome cài trên máy ở chế độ ẩn danh; tab mở thêm dùng chung phiên đăng nhập", bg="#f3f4f7").pack(anchor="w", padx=8, pady=8)
-        hold_bar = tk.Frame(hold_tab, bg="#ffffff", relief="solid", borderwidth=1)
-        hold_bar.pack(fill="x", padx=8, pady=8)
-        self.tool_button(hold_bar, "Import Mail", self.import_accounts, "#00a884", "#ffffff").pack(side="left", padx=8, pady=6)
-        tk.Label(hold_bar, text="Threads", bg="#ffffff").pack(side="left", padx=8, pady=6)
-        self.hold_threads_entry = tk.Entry(hold_bar, width=6); self.hold_threads_entry.insert(0, "2"); self.hold_threads_entry.pack(side="left", pady=6)
-        self.tool_button(hold_bar, "Bắt đầu", self.start_hold_mode, "#059669", "#ffffff").pack(side="left", padx=8, pady=6)
-        self.tool_button(hold_bar, "Dừng", self.stop, "#dc2626", "#ffffff").pack(side="left", padx=4, pady=6)
-
+        notebook.add(add_link_tab, text="Quản lý CapCut")
         bar = tk.Frame(reg_tab, bg="#ffffff", relief="solid", borderwidth=1)
         bar.pack(fill="x", pady=(0, 8))
         self.tool_button(bar, "Import Mail", self.import_accounts, "#00a884", "#ffffff").pack(side="left", padx=8, pady=6)
@@ -493,7 +491,6 @@ class RegCapCutApp:
         self.delay_entry.pack(side="left", pady=6)
         self.delay_entry.bind("<FocusOut>", self._entry_lost_focus)
         self.tool_button(bar, "Reg thường", self.start, "#059669", "#ffffff").pack(side="left", padx=4, pady=6)
-        self.tool_button(bar, "Reg treo", self.start_hold_mode, "#7c3aed", "#ffffff").pack(side="left", padx=4, pady=6)
         self.tool_button(bar, "Stop", self.stop, "#dc2626", "#ffffff").pack(side="left", padx=4, pady=6)
 
         tk.Label(
@@ -566,8 +563,18 @@ class RegCapCutApp:
         self.add_link_delay_entry.bind("<FocusOut>", self._entry_lost_focus)
         self.tool_button(bar, "Bắt đầu", self.start_add_link, "#059669", "#ffffff").pack(side="left", padx=4, pady=6)
         self.tool_button(bar, "Dừng", self.stop, "#dc2626", "#ffffff").pack(side="left", padx=4, pady=6)
-        self.tool_button(bar, "Kiểm tra CapCut Pro", self.start_check_pro, "#7c3aed", "#ffffff").pack(side="right", padx=(4, 8), pady=6)
-        self.tool_button(bar, "Đăng nhập & lấy user", self.start_check_user, "#0f766e", "#ffffff").pack(side="right", padx=(4, 0), pady=6)
+        check_buttons = tk.Frame(bar, bg="#ffffff")
+        check_buttons.pack(side="right", padx=(4, 8), pady=6)
+        self.tool_button(check_buttons, "Kiểm tra CapCut Pro", self.start_check_pro, "#7c3aed", "#ffffff").pack(fill="x")
+        space_buttons = tk.Frame(check_buttons, bg="#ffffff")
+        space_buttons.pack(fill="x", pady=(4, 0))
+        self.tool_button(space_buttons, "Check Space", self.start_check_space, "#0369a1", "#ffffff").pack(side="left")
+        self.tool_button(space_buttons, "Check Gốc Fam", self.start_check_fam_origin, "#6d28d9", "#ffffff").pack(side="left", padx=(4, 0))
+        self.tool_button(space_buttons, "Out Fam", self.start_out_fam, "#b45309", "#ffffff").pack(side="left", padx=(4, 0))
+        login_buttons = tk.Frame(bar, bg="#ffffff")
+        login_buttons.pack(side="right", padx=(4, 0), pady=6)
+        self.tool_button(login_buttons, "Đăng nhập & lấy user", self.start_check_user, "#0f766e", "#ffffff").pack(fill="x")
+        self.tool_button(login_buttons, "Đăng nhập treo", self.start_hold_mode, "#7c3aed", "#ffffff").pack(fill="x", pady=(4, 0))
 
         tk.Label(
             parent,
@@ -607,6 +614,20 @@ class RegCapCutApp:
         self.tool_button(account_header, "Xuất email|username", self.export_checked_usernames, "#1d4ed8", "#ffffff").pack(side="right", padx=(6, 0))
         self.tool_button(
             account_header,
+            "Xuất email|user gốc|số member",
+            self.export_checked_fam_members,
+            "#6d28d9",
+            "#ffffff",
+        ).pack(side="right", padx=(6, 0))
+        self.tool_button(
+            account_header,
+            "Xuất email|user|owner",
+            self.export_out_fam_accounts,
+            "#b45309",
+            "#ffffff",
+        ).pack(side="right", padx=(6, 0))
+        self.tool_button(
+            account_header,
             "Xóa tài khoản đã tích chọn",
             self.delete_checked_add_link_accounts,
             "#b91c1c",
@@ -641,12 +662,12 @@ class RegCapCutApp:
         tree.heading("account", text="Tài khoản")
         tree.heading("username", text="Username")
         tree.heading("status", text="Trạng thái thêm link")
-        tree.heading("pro_status", text="Trạng thái CapCut Pro")
+        tree.heading("pro_status", text="Trạng thái CapCut")
         tree.column("checked", width=65, minwidth=60, anchor="center", stretch=False)
         tree.column("account", width=300, minwidth=210, anchor="w")
         tree.column("username", width=180, minwidth=130, anchor="w")
         tree.column("status", width=210, minwidth=160, anchor="w")
-        tree.column("pro_status", width=190, minwidth=150, anchor="w")
+        tree.column("pro_status", width=360, minwidth=220, anchor="w")
         scrollbar = ttk.Scrollbar(account_table, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=scrollbar.set)
         tree.pack(side="left", fill="both", expand=True)
@@ -717,6 +738,11 @@ class RegCapCutApp:
             return "Lỗi kiểm tra"
         return "Chưa kiểm tra"
 
+    @classmethod
+    def _capcut_status_text(cls, account):
+        space_status = str(account.get("space_status", "")).strip()
+        return space_status or cls._check_pro_status_text(account.get("pro_status"))
+
     def _refresh_add_link_account_table(self, preserve_rows=None):
         tree = self.add_link_account_tree
         if tree is None or not tree.winfo_exists():
@@ -734,7 +760,7 @@ class RegCapCutApp:
                     user,
                     account.get("userID", ""),
                     self._add_link_account_status_text(account.get("status")),
-                    self._check_pro_status_text(account.get("pro_status")),
+                    self._capcut_status_text(account),
                 ),
             )
         valid_rows = [row for row in rows if tree.exists(row)]
@@ -811,6 +837,13 @@ class RegCapCutApp:
     def _read_add_link_account_state(self):
         if not hasattr(self, "add_link_account_state_path"):
             return {}
+        # Serialize reads with replacement of the history file on Windows.
+        with self.add_link_result_lock:
+            return self._read_add_link_account_state_unlocked()
+
+    def _read_add_link_account_state_unlocked(self):
+        if not hasattr(self, "add_link_account_state_path"):
+            return {}
         try:
             data = json.loads(self.add_link_account_state_path.read_text(encoding="utf-8"))
             return data if isinstance(data, dict) else {}
@@ -823,20 +856,22 @@ class RegCapCutApp:
             # Retain history even when an account is removed from the table or
             # another file is imported. Snapshot under the write lock so an
             # older worker cannot overwrite a newer successful result.
-            payload = self._read_add_link_account_state()
+            payload = self._read_add_link_account_state_unlocked()
             for account in self.add_link_accounts:
                 key = account["user"].casefold()
                 previous = payload.get(key, {})
                 if isinstance(previous, dict):
                     if previous.get("status") == "true":
                         account["status"] = "true"
-                    if previous.get("assigned_link"):
-                        account["assigned_link"] = previous["assigned_link"]
+                    if _add_link_assignment(previous):
+                        account["assigned_link"] = _add_link_assignment(previous)
                     if previous.get("join_pending") and account.get("status") != "true":
                         account["join_pending"] = True
+                account["assigned_link"] = _add_link_assignment(account)
                 payload[key] = {
                     "status": account.get("status", ""),
                     "pro_status": account.get("pro_status", ""),
+                    "space_status": account.get("space_status", ""),
                     "userID": account.get("userID", ""),
                     "assigned_link": account.get("assigned_link", ""),
                     "join_pending": bool(account.get("join_pending")),
@@ -862,6 +897,7 @@ class RegCapCutApp:
                         "passnew": account["passnew"],
                         "status": account.get("status", ""),
                         "pro_status": account.get("pro_status", ""),
+                        "space_status": account.get("space_status", ""),
                         "userID": account.get("userID", ""),
                         "assigned_link": account.get("assigned_link", ""),
                         "join_pending": bool(account.get("join_pending")),
@@ -923,6 +959,13 @@ class RegCapCutApp:
             if join_pending:
                 status = "join unverified"
             pro_status = str(item.get("pro_status", ""))
+            space_status = str(history.get("space_status") or item.get("space_status", ""))
+            if space_status in {"Chờ kiểm tra", "Đang kiểm tra Space"}:
+                space_status = "Đã dừng kiểm tra Space"
+            elif space_status in {"Chờ Out Fam", "Đang Out Fam"}:
+                space_status = "Đã dừng Out Fam"
+            elif space_status in {"Chờ Check Gốc Fam", "Đang Check Gốc Fam"}:
+                space_status = "Đã dừng Check Gốc Fam"
             user_id = str(item.get("userID", "")).strip()
             accounts.append(
                 {
@@ -932,6 +975,7 @@ class RegCapCutApp:
                     "passnew": password,
                     "status": "stopped" if status == "running" else status,
                     "pro_status": "stopped" if pro_status == "running" else pro_status,
+                    "space_status": space_status,
                     "userID": user_id,
                     "assigned_link": str(history.get("assigned_link") or item.get("assigned_link", "") or "").strip(),
                     "join_pending": join_pending,
@@ -1381,11 +1425,20 @@ class RegCapCutApp:
             state = saved_state.get(key, {})
             saved_status = state.get("status", "") if isinstance(state, dict) else ""
             saved_pro_status = state.get("pro_status", "") if isinstance(state, dict) else ""
+            saved_space_status = state.get("space_status", "") if isinstance(state, dict) else ""
             saved_user_id = state.get("userID", "") if isinstance(state, dict) else ""
             # If the application was closed while a profile was running, keep a
             # truthful persisted result instead of showing it as still running.
             account["status"] = "stopped" if saved_status == "running" else saved_status
             account["pro_status"] = "stopped" if saved_pro_status == "running" else saved_pro_status
+            if saved_space_status in {"Chờ kiểm tra", "Đang kiểm tra Space"}:
+                account["space_status"] = "Đã dừng kiểm tra Space"
+            elif saved_space_status in {"Chờ Out Fam", "Đang Out Fam"}:
+                account["space_status"] = "Đã dừng Out Fam"
+            elif saved_space_status in {"Chờ Check Gốc Fam", "Đang Check Gốc Fam"}:
+                account["space_status"] = "Đã dừng Check Gốc Fam"
+            else:
+                account["space_status"] = saved_space_status
             account["userID"] = str(saved_user_id or "").strip()
             account["assigned_link"] = str(state.get("assigned_link", "") or "").strip() if isinstance(state, dict) else ""
             account["join_pending"] = bool(state.get("join_pending")) if isinstance(state, dict) else False
@@ -1992,12 +2045,13 @@ class RegCapCutApp:
             account for account in self.add_link_accounts
             if account["user"].casefold() in selected_accounts
             and account.get("status") != "true"
-            and (not account.get("assigned_link") or account["assigned_link"] in self.add_link_run_links)
+            and (not _add_link_assignment(account) or _add_link_assignment(account) in self.add_link_run_links)
         ]
         if not self.add_link_run_accounts:
             messagebox.showinfo("Thông báo", "Không có tài khoản đã chọn phù hợp: tài khoản đã add thành công sẽ được bỏ qua; tài khoản đã phân link chỉ chạy lại link đó.")
             return
         for account in self.add_link_run_accounts:
+            account["assigned_link"] = _add_link_assignment(account)
             account["status"] = ""
         self._save_add_link_account_state()
         with self.add_link_counts_lock:
@@ -2070,7 +2124,7 @@ class RegCapCutApp:
 
             candidate_index = next((
                 i for i, account in enumerate(pending)
-                if not account.get("assigned_link") or account["assigned_link"] == link
+                if not _add_link_assignment(account) or _add_link_assignment(account) == link
             ), None)
             if candidate_index is None:
                 link_index += 1
@@ -2119,12 +2173,12 @@ class RegCapCutApp:
             if isinstance(history, dict):
                 if history.get("status") == "true":
                     account["status"] = "true"
-                if history.get("assigned_link"):
-                    account["assigned_link"] = history["assigned_link"]
+                if _add_link_assignment(history):
+                    account["assigned_link"] = _add_link_assignment(history)
                 if history.get("join_pending"):
                     account["join_pending"] = True
             if account.get("status") == "true" or (
-                account.get("assigned_link") and account["assigned_link"] != link
+                _add_link_assignment(account) and _add_link_assignment(account) != link
             ):
                 print(
                     f"[CAPCUT][ADD LINK][WORKER] Skipped by saved state: {account['user']} | "
@@ -2324,12 +2378,19 @@ class RegCapCutApp:
         self.task_thread.start()
 
     def start_hold_mode(self):
-        selected = [a for a in self.accounts if a.get("picked")]
+        if not self.add_link_accounts:
+            messagebox.showinfo("Thông báo", "Hãy nhập tài khoản vào Bảng acc thêm link trước")
+            return
+        selected = [
+            account
+            for account in self.add_link_accounts
+            if account["user"].casefold() in self.add_link_account_selected
+        ]
         if not selected:
-            messagebox.showinfo("Info", "Hãy tích chọn tài khoản")
+            messagebox.showinfo("Thông báo", "Hãy tích ít nhất một tài khoản trong Bảng acc thêm link")
             return
         if self.task_thread and self.task_thread.is_alive():
-            messagebox.showinfo("Info", "Một tác vụ đang chạy")
+            messagebox.showinfo("Thông báo", "Một tác vụ CapCut đang chạy")
             return
         try:
             resolve_installed_chrome()
@@ -2337,15 +2398,13 @@ class RegCapCutApp:
             messagebox.showerror("Google Chrome", str(exc))
             return
         try:
-            threads = max(1, int(self.threads_entry.get().strip() or "1"))
+            threads = max(1, int(self.add_link_threads_entry.get().strip() or "1"))
         except ValueError:
-            messagebox.showinfo("Info", "Threads phải là số")
+            messagebox.showinfo("Thông báo", "Số luồng phải là một số")
             return
         self.hold_mode = True
         self.stop_event.clear()
-        self.current_accounts = selected
-        for account in selected:
-            account["passnew"] = self.passnew_entry.get().strip() or "1234567"
+        self.current_accounts = list(selected)
         self.task_thread = threading.Thread(target=self.run_hold_accounts, args=(selected, threads), daemon=True)
         self.task_thread.start()
 
@@ -2360,7 +2419,7 @@ class RegCapCutApp:
                         return
                     index = next_index[0]
                     next_index[0] += 1
-                self.run_worker(accounts[index], "capcut", index, len(accounts), semaphore, max_threads)
+                self.run_hold_login_worker(accounts[index], index, semaphore, max_threads)
         workers = [threading.Thread(target=worker_loop, daemon=True) for _ in range(max_threads)]
         for worker in workers:
             worker.start()
@@ -2369,7 +2428,31 @@ class RegCapCutApp:
         self.current_accounts = []
         self.task_thread = None
         self.hold_mode = False
-        print("Reg CapCut treo workflow completed")
+        print("Đăng nhập treo CapCut đã hoàn tất")
+
+    def run_hold_login_worker(self, account, index, semaphore, max_threads):
+        with semaphore:
+            session = None
+            try:
+                if self.stop_event.is_set():
+                    return
+                session, result = self._start_account_browser(
+                    account, index, max_threads, startup_url=CAPCUT_LOGIN_URL,
+                )
+                run_capcut_login_hold_workflow(
+                    account,
+                    {
+                        "start_result": result,
+                        "stop_event": self.stop_event,
+                        "on_logged_in": lambda: self._wait_for_hold_profile(result, account["user"]),
+                    },
+                )
+            except CapCutWorkflowInterrupted as exc:
+                print(f'[CAPCUT][LOGIN TREO] Đã dừng: {account["user"]} - {exc}')
+            except Exception as exc:
+                print(f'[CAPCUT][LOGIN TREO] Lỗi: {account["user"]} - {exc}')
+            finally:
+                self._close_standalone_process(session)
 
     def run_accounts(self, accounts, max_threads, launch_delay):
         group_name = self.selected_group_name()

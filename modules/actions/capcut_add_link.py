@@ -608,7 +608,20 @@ def _login_with_email(page, account: dict, stop_event, max_attempts: int = 3) ->
                 page.goto("about:blank", wait_until="domcontentloaded", timeout=10000)
             except Exception:
                 pass
-            _wait(min(5.0, 1.5 * attempt), stop_event, user)
+            rate_limited = "try again later" in lowered or "too many attempts" in lowered
+            if rate_limited:
+                # CapCut's login throttle does not clear during the old 1.5–3s
+                # retry interval. Drop the rejected session cookies and use an
+                # interruptible cooldown before submitting this account again.
+                try:
+                    page.context.clear_cookies()
+                except Exception:
+                    pass
+                cooldown = min(60.0, 15.0 * attempt)
+                print(f"[CAPCUT][LOGIN] Rate limited; cooling down {cooldown:g}s: {user}")
+                _wait(cooldown, stop_event, user)
+            else:
+                _wait(min(5.0, 1.5 * attempt), stop_event, user)
     raise CapCutLoginError(
         f"CapCut login failed after {attempts} attempts for {user}: {last_error}"
     ) from last_error
@@ -752,6 +765,25 @@ def run_capcut_check_user_workflow(account: dict, context: dict | None = None) -
         if not username:
             raise RuntimeError(f"CapCut username was not found for {user}")
         return username
+
+
+def run_capcut_login_hold_workflow(account: dict, context: dict | None = None) -> bool:
+    """Log in to an existing CapCut account and keep its browser open."""
+    if not account.get("user") or not account.get("passnew"):
+        raise RuntimeError("Missing CapCut email or password")
+
+    user = account["user"]
+    stop_event = (context or {}).get("stop_event")
+    cdp_url = _cdp_url(context)
+    with sync_playwright() as playwright:
+        browser = _connect_browser(playwright, cdp_url, user, stop_event)
+        page = open_workflow_page(browser, context)
+        _login_with_email(page, account, stop_event)
+        print(f"[CAPCUT][LOGIN TREO] Đăng nhập thành công: {user}")
+        on_logged_in = (context or {}).get("on_logged_in")
+        if on_logged_in is not None:
+            on_logged_in()
+        return True
 
 
 def run_capcut_check_pro_workflow(account: dict, context: dict | None = None) -> bool:

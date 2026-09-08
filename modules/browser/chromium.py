@@ -202,5 +202,4 @@ def open_workflow_page(browser, context):
                 for tab in list(existing.pages):
                     tab.close()
         return page
-    browser_context = browser.contexts[0] if browser.contexts else browser.new_context()
-    return browser_context.pages[0] if browser_context.pages else browser_context.new_page()
+    raise RuntimeError("Workflow requires an incognito Chromium session")

@@ -7,11 +7,31 @@ from unittest.mock import Mock, patch
 
 from playwright.sync_api import sync_playwright
 
+from core.orchestrator import Orchestrator
+from core.settings import BrowserWindowSettings
 from modules.browser.chromium import ChromiumSession, open_workflow_page, parse_browser_proxy, resolve_chromium_154
 from modules.ui.reg_capcut_tab import RegCapCutApp
 
 
 class ChromiumSessionTests(unittest.TestCase):
+    def test_all_gpm_profile_starts_force_incognito_once(self):
+        app = Orchestrator.__new__(Orchestrator)
+        app.settings = SimpleNamespace(browser_window=BrowserWindowSettings())
+        app.gpm = Mock()
+        app.gpm.start_profile.return_value = SimpleNamespace(success=True)
+
+        app.start_profile("profile-1", addination_args="--disable-extensions")
+        self.assertEqual(
+            app.gpm.start_profile.call_args.kwargs["addination_args"],
+            "--disable-extensions --incognito",
+        )
+
+        app.start_profile("profile-2", addination_args="--incognito")
+        self.assertEqual(
+            app.gpm.start_profile.call_args.kwargs["addination_args"],
+            "--incognito",
+        )
+
     def test_hold_reuses_startup_incognito_context_for_new_tabs(self):
         page = Mock()
         startup_context = Mock()
@@ -23,6 +43,13 @@ class ChromiumSessionTests(unittest.TestCase):
         self.assertIs(open_workflow_page(browser, {"start_result": session}), page)
         browser.new_context.assert_not_called()
         startup_context.new_page.assert_not_called()
+
+    def test_workflow_page_rejects_a_regular_chrome_session(self):
+        browser = Mock()
+        session = SimpleNamespace(reuse_startup_context=False, incognito=False, proxy=None)
+        with self.assertRaisesRegex(RuntimeError, "requires an incognito"):
+            open_workflow_page(browser, {"start_result": session})
+        browser.new_context.assert_not_called()
 
     def test_delete_checked_reg_accounts_removes_only_checked_rows(self):
         app = RegCapCutApp.__new__(RegCapCutApp)

@@ -75,7 +75,7 @@ class Orchestrator:
         window_index: int | None = None,
         total_windows: int | None = None,
     ) -> GPMProfileStartResult:
-        """Start a profile in GPM."""
+        """Start a GPM profile in an incognito browser session."""
         layout: BrowserWindowLayout | None = None
         if window_index is not None and total_windows is not None:
             layout = resolve_browser_window_layout(
@@ -84,9 +84,13 @@ class Orchestrator:
                 total_windows=total_windows,
             )
 
+        extra_args = str(addination_args or "").strip()
+        if "--incognito" not in extra_args.split():
+            extra_args = f"{extra_args} --incognito".strip()
+
         return self.gpm.start_profile(
             profile_id=profile_id,
-            addination_args=addination_args,
+            addination_args=extra_args,
             win_scale=win_scale if win_scale is not None else (layout.scale if layout else None),
             win_pos=win_pos if win_pos is not None else (layout.position if layout else None),
             win_size=win_size if win_size is not None else (layout.size if layout else None),
