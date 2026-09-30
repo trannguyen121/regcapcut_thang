@@ -7,7 +7,6 @@ import sys
 import threading
 import time
 from pathlib import Path
-from types import SimpleNamespace
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -15,6 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from modules.actions.capcut_add_link import run_capcut_check_user_workflow
 from modules.ui.reg_capcut_tab import RegCapCutApp, parse_capcut_login_line
+from core.settings import load_settings
 
 
 def save_results(path: Path, accounts: list[dict]) -> None:
@@ -30,26 +30,17 @@ def save_results(path: Path, accounts: list[dict]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--accounts", default="account.txt")
-    parser.add_argument(
-        "--browser",
-        default="dist/chrome-win/chrome.exe",
-    )
     parser.add_argument("--passes", type=int, default=2)
     args = parser.parse_args()
 
     account_path = Path(args.accounts)
-    browser_path = Path(args.browser).resolve()
     accounts = [
         account
         for line in account_path.read_text(encoding="utf-8-sig").splitlines()
         if (account := parse_capcut_login_line(line)) is not None
     ]
-    if not browser_path.is_file():
-        raise RuntimeError(f"Chromium 154 not found: {browser_path}")
-
     app = RegCapCutApp.__new__(RegCapCutApp)
-    from core.settings import BrowserWindowSettings
-    app.app_settings = SimpleNamespace(chromium_path=str(browser_path), browser_window=BrowserWindowSettings())
+    app.app_settings = load_settings()
     app.active_profiles_lock = threading.Lock()
     app.active_standalone_processes = {}
     stop_event = threading.Event()

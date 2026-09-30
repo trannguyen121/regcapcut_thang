@@ -2,6 +2,7 @@ import base64
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -108,18 +109,66 @@ class ChromiumSessionTests(unittest.TestCase):
             parse_browser_proxy("socks5://user:secret@host:1080")
         self.assertNotIn("secret", str(error.exception))
 
-    def test_all_worker_launches_forward_proxy_and_thread_layout(self):
+    def test_account_browser_launches_without_proxy_and_keeps_thread_layout(self):
         app = RegCapCutApp.__new__(RegCapCutApp)
-        proxy = object()
         account = {"user": "mail"}
-        app.proxy_for_worker = Mock(return_value=proxy)
-        app.get_account_raw_proxy = Mock(return_value="host:8080:user:pass")
         app._start_standalone_chromium = Mock(return_value=("process", "result"))
         self.assertEqual(app._start_account_browser(account, 4, 3), ("process", "result"))
-        app.get_account_raw_proxy.assert_called_once_with(account, proxy)
         kwargs = app._start_standalone_chromium.call_args.kwargs
-        self.assertEqual(kwargs["raw_proxy"], "host:8080:user:pass")
+        self.assertNotIn("raw_proxy", kwargs)
         self.assertEqual(kwargs["max_threads"], 3)
+
+    def test_account_browser_can_reuse_the_visible_startup_incognito_context(self):
+        app = RegCapCutApp.__new__(RegCapCutApp)
+        account = {"user": "mail"}
+        app.hold_mode = False
+        app._start_standalone_chromium = Mock(return_value=("process", "result"))
+
+        result = app._start_account_browser(
+            account,
+            0,
+            1,
+            reuse_startup_context=True,
+        )
+
+        self.assertEqual(result, ("process", "result"))
+        self.assertTrue(
+            app._start_standalone_chromium.call_args.kwargs["reuse_startup_context"]
+        )
+
+    def test_registration_uses_configured_chrome_154_incognito_session(self):
+        app = RegCapCutApp.__new__(RegCapCutApp)
+        account = {"user": "mail"}
+        app._start_standalone_chromium = Mock(return_value=("process", "result"))
+
+        result = app._start_registration_browser(account, 1, 3)
+
+        self.assertEqual(result, ("process", "result"))
+        kwargs = app._start_standalone_chromium.call_args.kwargs
+        self.assertNotIn("browser_override", kwargs)
+        self.assertNotIn("raw_proxy", kwargs)
+        self.assertEqual(kwargs["max_threads"], 3)
+        self.assertNotIn("expected_major", kwargs)
+
+    def test_standalone_browser_resolves_and_enforces_chrome_154(self):
+        app = RegCapCutApp.__new__(RegCapCutApp)
+        app.app_settings = SimpleNamespace(chromium_path="custom-chrome", browser_window=None)
+        app.stop_event = threading.Event()
+        app.active_profiles_lock = threading.Lock()
+        app.active_standalone_processes = {}
+        session = SimpleNamespace(profile_dir=Path("temporary-profile"))
+
+        with (
+            patch("modules.ui.reg_capcut_tab.resolve_chromium_154", return_value=Path("chrome.exe")) as resolve,
+            patch("modules.ui.reg_capcut_tab.ChromiumSession", return_value=session) as chromium_session,
+        ):
+            process, result = app._start_standalone_chromium({"user": "mail"}, 0)
+
+        resolve.assert_called_once_with("custom-chrome")
+        self.assertEqual(chromium_session.call_args.args[0], Path("chrome.exe"))
+        self.assertEqual(chromium_session.call_args.kwargs["expected_major"], "154")
+        self.assertIs(process, session)
+        self.assertIs(result, session)
 
     def test_stop_closes_every_session_without_gpm(self):
         app = RegCapCutApp.__new__(RegCapCutApp)
@@ -140,7 +189,7 @@ class ChromiumSessionTests(unittest.TestCase):
         app.stop_event = threading.Event()
         app.active_change_profiles_lock = threading.Lock()
         app.active_change_profiles = {}
-        app.app_settings = SimpleNamespace(chromium_path="chrome.exe", browser_window=None)
+        app.app_settings = SimpleNamespace(chromium_path="chrome-154", browser_window=None)
         app.mark_account_status = Mock()
         app.proxy_for_worker = Mock(return_value=None)
         app.get_account_raw_proxy = Mock(return_value="")
@@ -149,11 +198,14 @@ class ChromiumSessionTests(unittest.TestCase):
         session = Mock()
         account = {"user": "mail"}
         with (
-            patch("tk_ui.resolve_chromium_154", return_value="chrome.exe"),
-            patch("tk_ui.ChromiumSession", return_value=session),
+            patch("tk_ui.resolve_chromium_154", return_value="chrome.exe") as chrome,
+            patch("tk_ui.ChromiumSession", return_value=session) as chromium_session,
             patch("tk_ui.run_capcut_workflow", return_value=True) as workflow,
         ):
             app.run_change_worker(account, "capcut", 0, 1, threading.Semaphore(1), "Reg CapCut", 1)
+        chrome.assert_called_once_with("chrome-154")
+        self.assertEqual(chromium_session.call_args.args[0], "chrome.exe")
+        self.assertNotIn("expected_major", chromium_session.call_args.kwargs)
         workflow.assert_called_once()
         self.assertIs(workflow.call_args.args[1]["start_result"], session)
         app.write_reg_capcut_result.assert_called_once_with(account, True)
@@ -255,8 +307,11 @@ class ChromiumBrowserTests(unittest.TestCase):
         thread.start()
         session = None
         try:
-            session = ChromiumSession(self.browser_path, headless=True,
-                                      raw_proxy=f"127.0.0.1:{server.server_port}:test:password")
+            session = ChromiumSession(
+                self.browser_path,
+                headless=True,
+                raw_proxy=f"127.0.0.1:{server.server_port}:test:password",
+            )
             with sync_playwright() as p:
                 browser = p.chromium.connect_over_cdp("http://" + session.remote_debugging_address)
                 page = open_workflow_page(browser, {"start_result": session})

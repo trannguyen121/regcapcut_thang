@@ -18,7 +18,11 @@ from modules.actions.capcut_add_link import (
     _pro_plan_visible,
 )
 from modules.ui.reg_capcut_tab import (
+    ADD_LINK_MEMBER_LIMIT,
+    TWO_SLOT_MEMBER_LIMIT,
     RegCapCutApp,
+    assign_links,
+    normalize_add_link,
     parse_add_link_line,
     parse_capcut_login_line,
 )
@@ -111,7 +115,7 @@ class CapCutAddLinkTests(unittest.TestCase):
 
             self.assertEqual(len(joined), 8)
             self.assertEqual(len({email for email, _ in joined}), 8)
-            self.assertEqual(app.add_link_counts, {"https://space-a": 6, "https://space-b": 2})
+            self.assertEqual(app.add_link_counts, {"https://space-a": 4, "https://space-b": 4})
 
     def test_uncertain_submit_is_never_reassigned_to_another_link(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -145,7 +149,7 @@ class CapCutAddLinkTests(unittest.TestCase):
             app.add_link_account_state_path.write_text(json.dumps(state), encoding="utf-8")
             app.add_link_accounts_path.write_text("mail@example.com|pass\n", encoding="utf-8")
             app.load_add_link_accounts()
-            app.add_link_counts["https://space-a"] = 6
+            app.add_link_counts["https://space-a"] = ADD_LINK_MEMBER_LIMIT
             app.add_link_selected = {"https://space-b"}
             app.add_link_threads_entry = types.SimpleNamespace(get=lambda: "1")
             app.add_link_delay_entry = types.SimpleNamespace(get=lambda: "0")
@@ -165,7 +169,7 @@ class CapCutAddLinkTests(unittest.TestCase):
                     self.assertFalse(worker.is_alive())
                 run.assert_called_once()
             self.assertEqual(app.add_link_accounts[0]["status"], "true")
-            self.assertEqual(app.add_link_counts, {"https://space-a": 6, "https://space-b": 1})
+            self.assertEqual(app.add_link_counts, {"https://space-a": 4, "https://space-b": 1})
 
     def test_login_failure_with_pending_submit_keeps_original_link(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -234,6 +238,42 @@ class CapCutAddLinkTests(unittest.TestCase):
                 workflow.assert_not_called()
             self.assertEqual(stale["status"], "true")
             self.assertFalse(app.add_link_fail_path.exists())
+
+    def test_both_add_link_modes_reuse_the_initial_incognito_window(self):
+        for member_limit in (ADD_LINK_MEMBER_LIMIT, TWO_SLOT_MEMBER_LIMIT):
+            with self.subTest(member_limit=member_limit), tempfile.TemporaryDirectory() as directory:
+                account = {"user": "mail@example.com", "passnew": "pass"}
+                app = self._make_add_link_app(directory, [account])
+                process = Mock()
+                session = types.SimpleNamespace(
+                    success=True,
+                    incognito=True,
+                    reuse_startup_context=True,
+                    proxy=None,
+                )
+                app._start_account_browser = Mock(return_value=(process, session))
+
+                with patch(
+                    "modules.ui.reg_capcut_tab.run_capcut_add_link_workflow",
+                    return_value=True,
+                ) as workflow:
+                    app.run_add_link_worker(
+                        account,
+                        "https://space-a",
+                        "group",
+                        0,
+                        1,
+                        threading.Semaphore(1),
+                        1,
+                        member_limit=member_limit,
+                    )
+
+                self.assertTrue(
+                    app._start_account_browser.call_args.kwargs[
+                        "reuse_startup_context"
+                    ]
+                )
+                self.assertIs(workflow.call_args.args[2]["start_result"], session)
 
     def test_already_joined_is_saved_without_incrementing_link_usage(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -332,15 +372,86 @@ class CapCutAddLinkTests(unittest.TestCase):
     def test_link_line_accepts_plain_url_and_saved_usage_count(self):
         self.assertEqual(parse_add_link_line("https://plain-link"), ("https://plain-link", 0))
         self.assertEqual(parse_add_link_line("https://used-link|3"), ("https://used-link", 3))
-        self.assertEqual(parse_add_link_line("https://full-link|99"), ("https://full-link", 6))
+        self.assertEqual(
+            parse_add_link_line("https://full-link|99"),
+            ("https://full-link", ADD_LINK_MEMBER_LIMIT),
+        )
         self.assertIsNone(parse_add_link_line("not-a-link|2"))
+
+    def test_link_normalization_deduplicates_trailing_slash_and_fragment(self):
+        link = "https://www.capcut.com/sv2/example"
+        self.assertEqual(normalize_add_link(link + "/"), link)
+        self.assertEqual(normalize_add_link(link + "/#ignored"), link)
+        self.assertEqual(parse_add_link_line(link + "/|2"), (link, 2))
+
+    def test_explicit_start_reset_overwrites_terminal_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            account = {
+                "user": "done@example.com",
+                "passnew": "pass",
+                "status": "true",
+                "assigned_link": "https://old",
+                "join_pending": False,
+            }
+            app = self._make_add_link_app(directory, [account])
+            app._save_add_link_account_state()
+
+            account.update(status="", assigned_link="", join_pending=False)
+            app._save_add_link_account_state(overwrite_users={account["user"]})
+
+            saved = app._read_add_link_account_state()[account["user"]]
+            self.assertEqual(saved["status"], "")
+            self.assertEqual(saved["assigned_link"], "")
+            self.assertFalse(saved["join_pending"])
+
+    def test_five_slot_package_assigns_only_four_accounts_per_link(self):
+        accounts = [{"user": f"mail{i}"} for i in range(6)]
+        assignments = assign_links(accounts, ["https://one", "https://two"])
+
+        self.assertEqual(
+            [link for _account, link in assignments],
+            ["https://one"] * 4 + ["https://two"] * 2,
+        )
+
+    def test_two_slot_button_starts_with_one_account_per_link(self):
+        app = RegCapCutApp.__new__(RegCapCutApp)
+        app.start_add_link = Mock()
+
+        app.start_add_link_two_slot()
+
+        app.start_add_link.assert_called_once_with(
+            member_limit=TWO_SLOT_MEMBER_LIMIT
+        )
+
+    def test_two_slot_worker_marks_link_full_after_one_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            account = {"user": "mail@example.com", "passnew": "pass"}
+            app = self._make_add_link_app(directory, [account])
+
+            with patch(
+                "modules.ui.reg_capcut_tab.run_capcut_add_link_workflow",
+                return_value=True,
+            ):
+                app.run_add_link_worker(
+                    account,
+                    "https://space-a",
+                    "group",
+                    0,
+                    1,
+                    threading.Semaphore(1),
+                    1,
+                    member_limit=TWO_SLOT_MEMBER_LIMIT,
+                )
+
+            self.assertEqual(app.add_link_counts["https://space-a"], 1)
+            self.assertIn("https://space-a", app.add_link_full)
 
     def test_import_link_file_restores_saved_usage_count(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "links.txt"
             export_path = Path(directory) / "add_link_used.txt"
             path.write_text(
-                "https://plain\nhttps://used|4\nhttps://full|6\nhttps://from-export\n",
+                "https://plain\nhttps://used|3\nhttps://full|6\nhttps://from-export\n",
                 encoding="utf-8",
             )
             export_path.write_text("https://from-export|2\n", encoding="utf-8")
@@ -364,8 +475,8 @@ class CapCutAddLinkTests(unittest.TestCase):
                 app.add_link_counts,
                 {
                     "https://plain": 0,
-                    "https://used": 4,
-                    "https://full": 6,
+                    "https://used": 3,
+                    "https://full": 4,
                     "https://from-export": 2,
                 },
             )
@@ -532,7 +643,7 @@ class CapCutAddLinkTests(unittest.TestCase):
         self.assertEqual(app.task_thread.target, app.run_check_user_accounts)
         self.assertTrue(app.task_thread.started)
 
-    def test_check_user_worker_uses_standalone_chromium_154_instead_of_gpm(self):
+    def test_check_user_worker_uses_standalone_system_chrome_instead_of_gpm(self):
         class Process:
             def __init__(self):
                 self.terminated = False
@@ -563,8 +674,6 @@ class CapCutAddLinkTests(unittest.TestCase):
         app._save_add_link_account_state = lambda: None
         app.refresh_add_link_status = lambda: None
         app._request_expressvpn_reset = lambda: None
-        chromium = Path("chrome-154") / "chrome.exe"
-        app._resolve_chromium_154_browser = lambda: chromium
         process = Process()
         launches = []
 
@@ -617,9 +726,10 @@ class CapCutAddLinkTests(unittest.TestCase):
         app.add_link_threads_entry = Entry()
         app.task_thread = None
         app.stop_event = threading.Event()
+        app.app_settings = types.SimpleNamespace(chromium_path="chrome-154")
 
         with (
-            patch("modules.ui.reg_capcut_tab.resolve_installed_chrome", return_value=Path("chrome.exe")),
+            patch("modules.ui.reg_capcut_tab.resolve_chromium_154", return_value=Path("chrome.exe")),
             patch("modules.ui.reg_capcut_tab.threading.Thread", Thread),
         ):
             app.start_hold_mode()
@@ -663,7 +773,7 @@ class CapCutAddLinkTests(unittest.TestCase):
         app = RegCapCutApp.__new__(RegCapCutApp)
         app.stop_event = threading.Event()
         app.hold_mode = False
-        app._start_account_browser = lambda *args, **kwargs: (
+        app._start_registration_browser = lambda *args, **kwargs: (
             types.SimpleNamespace(terminate=lambda: None), types.SimpleNamespace(success=True),
         )
         app.active_profiles = {}
@@ -709,7 +819,7 @@ class CapCutAddLinkTests(unittest.TestCase):
             base = Path(directory)
             app = RegCapCutApp.__new__(RegCapCutApp)
             app.add_link_counts_lock = threading.Lock()
-            app.add_link_counts = {"https://full": 6, "https://error": 2, "https://unused": 0}
+            app.add_link_counts = {"https://full": 4, "https://error": 2, "https://unused": 0}
             app.add_link_errors = {"https://full": [], "https://error": ["mail|Can't join space"], "https://unused": []}
             app.add_link_export_path = base / "add_link_used.txt"
             app.add_link_remaining_path = base / "add_link_remaining.txt"
@@ -719,11 +829,11 @@ class CapCutAddLinkTests(unittest.TestCase):
 
             self.assertEqual(
                 app.add_link_export_path.read_text(encoding="utf-8").splitlines(),
-                ["https://full|6", "https://error|2", "https://unused|0"],
+                ["https://full|4", "https://error|2", "https://unused|0"],
             )
             self.assertEqual(
                 app.add_link_remaining_path.read_text(encoding="utf-8").splitlines(),
-                ["https://error|4", "https://unused|6"],
+                ["https://error|2", "https://unused|4"],
             )
             self.assertEqual(
                 app.add_link_error_path.read_text(encoding="utf-8"),
@@ -826,9 +936,12 @@ class CapCutAddLinkTests(unittest.TestCase):
             saved.add_link_account_selected = {"saved@example.com"}
             saved.add_link_links = ["https://saved-link"]
             saved.add_link_selected = {"https://saved-link"}
-            saved.add_link_counts = {"https://saved-link": 3}
+            saved.add_link_counts = {"https://saved-link": 1}
+            saved.add_link_limits = {
+                "https://saved-link": TWO_SLOT_MEMBER_LIMIT
+            }
             saved.add_link_errors = {"https://saved-link": []}
-            saved.add_link_full = set()
+            saved.add_link_full = {"https://saved-link"}
             saved._save_add_link_workspace()
 
             restored = RegCapCutApp.__new__(RegCapCutApp)
@@ -842,7 +955,12 @@ class CapCutAddLinkTests(unittest.TestCase):
             self.assertEqual(restored.add_link_accounts[0]["userID"], "user987654321")
             self.assertEqual(restored.add_link_account_selected, {"saved@example.com"})
             self.assertEqual(restored.add_link_links, ["https://saved-link"])
-            self.assertEqual(restored.add_link_counts, {"https://saved-link": 3})
+            self.assertEqual(restored.add_link_counts, {"https://saved-link": 1})
+            self.assertEqual(
+                restored.add_link_limits,
+                {"https://saved-link": TWO_SLOT_MEMBER_LIMIT},
+            )
+            self.assertEqual(restored.add_link_full, {"https://saved-link"})
             self.assertEqual(restored.add_link_selected, {"https://saved-link"})
             self.assertIs(restored.check_pro_accounts, restored.add_link_accounts)
 
@@ -885,7 +1003,7 @@ class CapCutAddLinkTests(unittest.TestCase):
             )
             self.assertEqual(
                 running.add_link_remaining_path.read_text(encoding="utf-8"),
-                f"{link}|4",
+                f"{link}|2",
             )
             workspace = json.loads(
                 running.add_link_workspace_path.read_text(encoding="utf-8")
@@ -897,8 +1015,8 @@ class CapCutAddLinkTests(unittest.TestCase):
             restarted.refresh_add_link_status = lambda: None
             restarted.restore_add_link_workspace()
 
-            self.assertEqual(restarted.add_link_counts, {link: 2})
-            self.assertEqual(restarted.add_link_selected, {link})
+            self.assertEqual(restarted.add_link_counts, {normalize_add_link(link): 2})
+            self.assertEqual(restarted.add_link_selected, {normalize_add_link(link)})
 
     def test_check_pro_summary_works_without_the_removed_separate_tab(self):
         app = RegCapCutApp.__new__(RegCapCutApp)
@@ -1084,7 +1202,10 @@ class CapCutAddLinkTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
             app = RegCapCutApp.__new__(RegCapCutApp)
-            app.add_link_accounts = [{"user": "mail", "passnew": "pass", "status": "true"}]
+            app.add_link_accounts = [{
+                "user": "mail", "passnew": "pass", "status": "true",
+                "assigned_link": "https://old", "join_pending": True,
+            }]
             app.add_link_accounts.extend([
                 {"user": "new", "passnew": "pass", "status": "login fail"},
                 {"user": "unchecked", "passnew": "pass", "status": "login fail"},
@@ -1102,7 +1223,7 @@ class CapCutAddLinkTests(unittest.TestCase):
             app.add_link_fail_path = base / "acc_add_fail.txt"
             app.stop_event = threading.Event()
             app.task_thread = None
-            app._save_add_link_account_state = lambda: None
+            app._save_add_link_account_state = lambda **_kwargs: None
             app._save_add_link_workspace = lambda: None
             app.write_add_link_results = lambda: None
             app.refresh_add_link_status = lambda: None
@@ -1112,15 +1233,17 @@ class CapCutAddLinkTests(unittest.TestCase):
 
             self.assertEqual(
                 app.add_link_counts,
-                {"https://part-used": 3, "https://full": 6},
+                {"https://part-used": 3, "https://full": 4},
             )
             self.assertEqual(app.add_link_full, {"https://full"})
             self.assertTrue(app.task_thread.started)
-            self.assertEqual([account["user"] for account in app.current_accounts], ["new"])
-            self.assertEqual(app.add_link_accounts[0]["status"], "true")
+            self.assertEqual([account["user"] for account in app.current_accounts], ["mail", "new"])
+            self.assertEqual(app.add_link_accounts[0]["status"], "")
+            self.assertEqual(app.add_link_accounts[0]["assigned_link"], "")
+            self.assertFalse(app.add_link_accounts[0]["join_pending"])
             self.assertEqual(app.add_link_accounts[2]["status"], "login fail")
 
-    def test_failed_account_is_replaced_until_link_has_six_successes(self):
+    def test_failed_account_is_replaced_until_link_has_four_successes(self):
         app = RegCapCutApp.__new__(RegCapCutApp)
         app.add_link_accounts = [{"user": f"mail{i}"} for i in range(8)]
         app.add_link_links = ["https://space"]
@@ -1149,13 +1272,13 @@ class CapCutAddLinkTests(unittest.TestCase):
         app.run_add_link_worker = types.MethodType(fake_worker, app)
         app.run_add_link_accounts(max_threads=1, launch_delay=0)
 
-        self.assertEqual(app.add_link_counts["https://space"], 6)
-        self.assertEqual(attempted, [f"mail{i}" for i in range(7)])
-        self.assertNotIn("mail7", attempted)
+        self.assertEqual(app.add_link_counts["https://space"], 4)
+        self.assertEqual(attempted, [f"mail{i}" for i in range(5)])
+        self.assertNotIn("mail5", attempted)
 
     def test_add_link_scheduler_uses_only_links_selected_in_the_table(self):
         app = RegCapCutApp.__new__(RegCapCutApp)
-        app.add_link_accounts = [{"user": f"mail{i}"} for i in range(6)]
+        app.add_link_accounts = [{"user": f"mail{i}"} for i in range(4)]
         app.add_link_links = ["https://disabled", "https://selected"]
         app.add_link_run_links = ["https://selected"]
         app.add_link_counts = {"https://disabled": 0, "https://selected": 0}
@@ -1179,9 +1302,9 @@ class CapCutAddLinkTests(unittest.TestCase):
         app.run_add_link_worker = types.MethodType(fake_worker, app)
         app.run_add_link_accounts(max_threads=1, launch_delay=0)
 
-        self.assertEqual(attempted_links, ["https://selected"] * 6)
+        self.assertEqual(attempted_links, ["https://selected"] * 4)
         self.assertEqual(app.add_link_counts["https://disabled"], 0)
-        self.assertEqual(app.add_link_counts["https://selected"], 6)
+        self.assertEqual(app.add_link_counts["https://selected"], 4)
 
 
 if __name__ == "__main__":

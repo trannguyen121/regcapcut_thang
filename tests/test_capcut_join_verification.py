@@ -4,10 +4,12 @@ from unittest.mock import Mock, patch
 
 from modules.actions.capcut_add_link import (
     AlreadyJoinedSpaceError,
+    JOIN_VERIFY_ATTEMPTS,
     JoinVerificationError,
     _join_space,
     _parse_invitation_membership,
     _read_invitation_membership,
+    _workspace_ids_from_payload,
 )
 
 
@@ -50,6 +52,12 @@ class JoinVerificationTests(unittest.TestCase):
                   before_submit=lambda: persisted.append(True))
         button.click.assert_called_once()
 
+    def test_eventually_consistent_membership_is_retried_without_another_submit(self):
+        page, button = self.page()
+        reads = [("123", False)] * 6 + [("123", True)]
+        self.join(page, reads)
+        button.click.assert_called_once()
+
     def test_click_timeout_is_verified_without_a_second_click(self):
         page, button = self.page()
         button.click.side_effect = RuntimeError("Click sent, navigation timed out")
@@ -60,7 +68,7 @@ class JoinVerificationTests(unittest.TestCase):
         page, button = self.page()
         page.url = "https://www.capcut.com/my-cloud/123"
         with self.assertRaises(JoinVerificationError):
-            self.join(page, [("123", False)] * 4)
+            self.join(page, [("123", False)] * (JOIN_VERIFY_ATTEMPTS + 1))
         button.click.assert_called_once()
 
     def test_different_workspace_cannot_confirm_success(self):
@@ -79,8 +87,7 @@ class JoinVerificationTests(unittest.TestCase):
         page, button = self.page()
         with self.assertRaises(JoinVerificationError):
             self.join(page, [("123", False)], pending=True)
-        with self.assertRaises(AlreadyJoinedSpaceError):
-            self.join(page, [("123", True)], pending=True)
+        self.join(page, [("123", True)], pending=True)
         button.click.assert_not_called()
 
     def test_failure_to_persist_prevents_submit(self):
@@ -102,6 +109,49 @@ class JoinVerificationTests(unittest.TestCase):
         ):
             with self.subTest(payload=payload), self.assertRaises(JoinVerificationError):
                 _parse_invitation_membership(payload)
+
+    def test_workspace_list_parser_requires_explicit_workspace_rows(self):
+        self.assertEqual(
+            _workspace_ids_from_payload({
+                "ret": "0",
+                "data": {"workspace_infos": [{"workspace_id": "123"}, {"workspace_id": 456}]},
+            }),
+            {"123", "456"},
+        )
+        self.assertEqual(_workspace_ids_from_payload({"ret": "1", "data": {}}), set())
+
+    def test_authenticated_workspace_list_overrides_stale_invitation_flag(self):
+        page = Mock()
+        page.url = "https://www.capcut.com/my-cloud/123"
+        frame = object()
+        page.main_frame = frame
+        workspace_response = SimpleNamespace(
+            url="https://edit-api-sg.capcut.com/cc/v1/workspace/get_user_workspaces",
+            request=SimpleNamespace(frame=frame, post_data_json={"cursor": "0"}),
+            ok=True,
+            status=200,
+            json=lambda: {"ret": "0", "data": {"workspace_infos": [{"workspace_id": "123"}]}},
+        )
+        invitation_response = SimpleNamespace(
+            url="https://edit-api-sg.capcut.com/cc/v1/workspace/get_workspace_info_by_invitation_link",
+            request=SimpleNamespace(frame=frame, post_data_json={"invitation_link": self.link}),
+            ok=True,
+            status=200,
+            json=lambda: {"ret": "0", "data": {"workspace_info": {
+                "workspace_id": "123", "is_member": False,
+            }}},
+        )
+        page.on.side_effect = lambda _event, callback: setattr(page, "response_callback", callback)
+
+        def navigate(*_args, **_kwargs):
+            page.response_callback(workspace_response)
+            page.response_callback(invitation_response)
+
+        page.goto.side_effect = navigate
+        self.assertEqual(
+            _read_invitation_membership(page, self.link, "test@example.com", None),
+            ("123", True),
+        )
 
     def test_membership_read_filters_origin_frame_and_invitation(self):
         page = Mock()

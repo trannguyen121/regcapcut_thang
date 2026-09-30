@@ -252,7 +252,7 @@ def _leave_spaces(page, account, spaces, targets, stop_event, record, operation)
     return {"before": initial, "after": len(expected), "left": left, "status": "ok"}
 
 
-def check_and_reduce_spaces(page, account, stop_event, record):
+def check_and_reduce_spaces(page, account, stop_event, record, resolve_member_username=None):
     user = account["user"]
     spaces = _read_teams(page, user, stop_event)
     initial = len(spaces)
@@ -269,6 +269,8 @@ def check_and_reduce_spaces(page, account, stop_event, record):
                      str(s.get("invitation_link") or "").rstrip("/") == assigned]
             or sorted(spaces, key=lambda s: s["workspace_id"]))[0]
     targets = [s for s in spaces if s["workspace_id"] != keep["workspace_id"]]
+    if targets and resolve_member_username is not None:
+        account["userID"] = resolve_member_username()
     return _leave_spaces(page, account, spaces, targets, stop_event, record, "Check Space")
 
 
@@ -291,12 +293,18 @@ def run_capcut_check_space_workflow(account, context, record):
         # temporary CapCut login throttle instead of failing the account after
         # three rapid submissions.
         _login_with_email(page, account, stop_event, max_attempts=5)
-        account["userID"] = extract_capcut_username(
-            page, user, stop_event, dismiss_popups=_dismiss_post_submit_popups
-        )
         page.goto(CAPCUT_MY_CLOUD_URL, wait_until="domcontentloaded", timeout=45000)
         _wait(2, stop_event, user)
-        return check_and_reduce_spaces(page, account, stop_event, record)
+        def resolve_member_username():
+            username = extract_capcut_username(
+                page, user, stop_event, dismiss_popups=_dismiss_post_submit_popups
+            )
+            page.goto(CAPCUT_MY_CLOUD_URL, wait_until="domcontentloaded", timeout=45000)
+            _wait(2, stop_event, user)
+            return username
+
+        return check_and_reduce_spaces(page, account, stop_event, record,
+                                       resolve_member_username=resolve_member_username)
 
 
 def run_capcut_out_fam_workflow(account, context, record):

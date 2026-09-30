@@ -22,6 +22,10 @@ from modules.actions.capcut_workflow import (
 
 CAPCUT_LOGIN_URL = "https://www.capcut.com/login"
 CAPCUT_MY_CLOUD_URL = "https://www.capcut.com/my-cloud"
+# Membership is eventually consistent after Submit. Real 5-slot spaces can
+# take tens of seconds to expose the new collaborator through the invitation API.
+JOIN_VERIFY_ATTEMPTS = 12
+JOIN_VERIFY_DELAY_SECONDS = 3.0
 
 
 class CannotJoinSpaceError(RuntimeError):
@@ -63,6 +67,24 @@ def _parse_invitation_membership(payload) -> tuple[str, bool]:
     return str(workspace_id), member
 
 
+def _workspace_ids_from_payload(payload) -> set[str]:
+    """Return workspace IDs explicitly listed for the authenticated account."""
+    if not isinstance(payload, dict) or str(payload.get("ret")) != "0":
+        return set()
+    data = payload.get("data")
+    rows = data.get("workspace_infos") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        return set()
+    return {
+        str(row["workspace_id"])
+        for row in rows
+        if isinstance(row, dict)
+        and isinstance(row.get("workspace_id"), (str, int))
+        and not isinstance(row.get("workspace_id"), bool)
+        and str(row["workspace_id"]).strip()
+    }
+
+
 def _read_invitation_membership(page, link: str, user: str, stop_event) -> tuple[str, bool]:
     """Reload this invitation and observe its own authenticated, read-only request."""
     _ensure_running(stop_event, user)
@@ -89,62 +111,82 @@ def _read_invitation_membership(page, link: str, user: str, stop_event) -> tuple
         except Exception:
             return False
 
-    captured = {"payload": None, "error": None, "status": None}
+    captured = {"payload": None, "error": None, "status": None, "workspace_ids": set()}
+
+    def is_workspace_list_response(response):
+        try:
+            url = urlsplit(response.url)
+            host = (url.hostname or "").casefold()
+            return (
+                url.scheme == "https"
+                and (host == "capcut.com" or host.endswith(".capcut.com")
+                     or host == "capcutapi.com" or host.endswith(".capcutapi.com"))
+                and url.path == "/cc/v1/workspace/get_user_workspaces"
+                and response.request.frame == page.main_frame
+            )
+        except Exception:
+            return False
+
+    def response_payload(response):
+        try:
+            return response.json()
+        except Exception as body_error:
+            request_body = response.request.post_data_json
+            original_headers = response.request.all_headers()
+            retry_headers = {
+                name: value
+                for name, value in original_headers.items()
+                if not name.startswith(":") and name.casefold() not in {
+                    "cookie", "host", "content-length", "connection", "accept-encoding",
+                }
+            }
+            print(
+                f"[CAPCUT][ADD LINK][VERIFY] Response body unavailable; "
+                f"retrying read-only API: {user} | {type(body_error).__name__}: {body_error}"
+            )
+            api_response = page.context.request.post(
+                response.url, data=request_body, headers=retry_headers, timeout=20000,
+            )
+            if not api_response.ok:
+                raise JoinVerificationError(
+                    f"CapCut membership retry returned HTTP {api_response.status}"
+                )
+            return api_response.json()
 
     def capture_membership(response):
-        if captured["payload"] is not None or captured["error"] is not None:
-            return
-        if not is_invitation_response(response):
+        invitation_response = is_invitation_response(response)
+        workspace_response = is_workspace_list_response(response)
+        if not invitation_response and not workspace_response:
             return
         try:
+            if workspace_response:
+                captured["workspace_ids"].update(
+                    _workspace_ids_from_payload(response_payload(response))
+                )
+                return
+            if captured["payload"] is not None or captured["error"] is not None:
+                return
             captured["status"] = response.status
             if not response.ok:
                 raise JoinVerificationError(
                     f"CapCut membership request returned HTTP {response.status}"
                 )
-            try:
-                # Read inside the response callback. The invitation immediately
-                # redirects members and Chromium may otherwise discard this body.
-                captured["payload"] = response.json()
-            except Exception as body_error:
-                # Chrome for Testing can report Network.getResponseBody missing.
-                # Replay only this read-only membership request through the same
-                # authenticated browser context; this never calls the join API.
-                request_body = response.request.post_data_json
-                original_headers = response.request.all_headers()
-                retry_headers = {
-                    name: value
-                    for name, value in original_headers.items()
-                    if not name.startswith(":") and name.casefold() not in {
-                        "cookie", "host", "content-length", "connection",
-                        "accept-encoding",
-                    }
-                }
+            # Read inside the callback because redirects can discard CDP bodies.
+            captured["payload"] = response_payload(response)
+            if str(captured["payload"].get("ret")) != "0":
                 print(
-                    f"[CAPCUT][ADD LINK][VERIFY] Response body unavailable; "
-                    f"retrying read-only membership API: {user} | "
-                    f"{type(body_error).__name__}: {body_error}"
+                    f"[CAPCUT][ADD LINK][VERIFY] Membership API retry rejected: {user} | "
+                    f"ret={captured['payload'].get('ret')} | "
+                    f"message={captured['payload'].get('msg') or captured['payload'].get('message') or ''}"
                 )
-                api_response = page.context.request.post(
-                    response.url,
-                    data=request_body,
-                    headers=retry_headers,
-                    timeout=20000,
-                )
-                captured["status"] = api_response.status
-                if not api_response.ok:
-                    raise JoinVerificationError(
-                        f"CapCut membership retry returned HTTP {api_response.status}"
-                    )
-                captured["payload"] = api_response.json()
-                if str(captured["payload"].get("ret")) != "0":
-                    print(
-                        f"[CAPCUT][ADD LINK][VERIFY] Membership API retry rejected: {user} | "
-                        f"ret={captured['payload'].get('ret')} | "
-                        f"message={captured['payload'].get('msg') or captured['payload'].get('message') or ''}"
-                    )
         except Exception as exc:
-            captured["error"] = exc
+            if invitation_response:
+                captured["error"] = exc
+            else:
+                print(
+                    f"[CAPCUT][ADD LINK][VERIFY] Workspace-list evidence unavailable: "
+                    f"{user} | {type(exc).__name__}: {exc}"
+                )
 
     page.on("response", capture_membership)
     try:
@@ -165,6 +207,17 @@ def _read_invitation_membership(page, link: str, user: str, stop_event) -> tuple
         if captured["payload"] is None:
             raise JoinVerificationError("Timed out waiting for CapCut membership response")
         workspace_id, is_member = _parse_invitation_membership(captured["payload"])
+        # The invitation endpoint can remain stale after a successful join. When
+        # CapCut redirects to My Cloud, allow its authenticated workspace list a
+        # short bounded window to provide authoritative membership evidence.
+        if not is_member and "/my-cloud/" in str(page.url):
+            for _ in range(30):
+                if workspace_id in captured["workspace_ids"]:
+                    break
+                _ensure_running(stop_event, user)
+                page.wait_for_timeout(100)
+        if workspace_id in captured["workspace_ids"]:
+            is_member = True
         print(
             f"[CAPCUT][ADD LINK][VERIFY] Invitation response: {user} | "
             f"workspace={workspace_id} | is_member={is_member}"
@@ -636,6 +689,9 @@ def _join_space(page, link: str, user: str, stop_event, *, before_submit=None, p
         f"is_member={is_member} | previous_submit_pending={pending}"
     )
     if is_member:
+        if pending:
+            print(f"[CAPCUT][ADD LINK] Previous Submit is now confirmed for {user}: {workspace_id}")
+            return
         raise AlreadyJoinedSpaceError(f"Already a member of workspace {workspace_id}: {user}")
     if pending:
         raise JoinVerificationError(f"Previous Submit is still unconfirmed for {user}; not submitting again")
@@ -687,9 +743,12 @@ def _join_space(page, link: str, user: str, stop_event, *, before_submit=None, p
         raise CannotJoinSpaceError(f"Can't join space: {user}")
     # Fresh invitation reads, never a second Submit. Match the exact workspace
     # identified before joining; neither My Cloud nor a pending request counts.
-    for attempt in range(3):
+    for attempt in range(JOIN_VERIFY_ATTEMPTS):
         _ensure_running(stop_event, user)
-        print(f"[CAPCUT][ADD LINK][VERIFY] Post-submit check {attempt + 1}/3: {user}")
+        print(
+            f"[CAPCUT][ADD LINK][VERIFY] Post-submit check "
+            f"{attempt + 1}/{JOIN_VERIFY_ATTEMPTS}: {user}"
+        )
         try:
             confirmed_id, confirmed_member = _read_invitation_membership(page, link, user, stop_event)
         except JoinVerificationError as exc:
@@ -700,8 +759,8 @@ def _join_space(page, link: str, user: str, stop_event, *, before_submit=None, p
         if confirmed_id == workspace_id and confirmed_member:
             print(f"[CAPCUT][ADD LINK] Membership confirmed for {user}: {workspace_id}")
             return
-        if attempt < 2:
-            _wait(2.0, stop_event, user)
+        if attempt < JOIN_VERIFY_ATTEMPTS - 1:
+            _wait(JOIN_VERIFY_DELAY_SECONDS, stop_event, user)
     raise JoinVerificationError(f"Submit sent but membership is not confirmed for {user}; not submitting again")
 
 

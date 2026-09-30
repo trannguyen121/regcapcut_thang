@@ -1,4 +1,4 @@
-"""Disposable Chromium 154 processes with an isolated incognito context."""
+"""Disposable Chrome 154 processes with an isolated incognito context."""
 
 import json
 import subprocess
@@ -13,7 +13,12 @@ from urllib.request import urlopen
 from core.settings import resolve_browser_window_layout
 
 
+CHROME_VERSION = "154.0.8037.0"
+CHROME_MAJOR_VERSION = CHROME_VERSION.split(".", 1)[0]
+
+
 def resolve_chromium_154(configured=""):
+    """Resolve the configured/bundled Chrome 154 executable."""
     root = Path(__file__).resolve().parents[2]
     configured = Path(str(configured or "").strip().strip('"'))
     candidates = [
@@ -25,7 +30,7 @@ def resolve_chromium_154(configured=""):
     for candidate in candidates:
         if candidate.is_file():
             return candidate.resolve()
-    raise RuntimeError("Không tìm thấy Chromium 154. Chọn chrome.exe hoặc thư mục chrome-154 trong Settings.")
+    raise RuntimeError("Không tìm thấy Chrome 154. Chọn chrome.exe hoặc thư mục chrome-154 trong Settings.")
 
 
 def resolve_installed_chrome():
@@ -78,14 +83,14 @@ def parse_browser_proxy(raw):
 
 class ChromiumSession:
     def __init__(self, browser, *, stop_event=None, raw_proxy="", window_settings=None,
-                 index=0, total_windows=1, headless=False, expected_major="154",
+                 index=0, total_windows=1, headless=False, expected_major=CHROME_MAJOR_VERSION,
                  reuse_startup_context=False):
         self.proxy = parse_browser_proxy(raw_proxy)
         self.incognito = True
         self.reuse_startup_context = bool(reuse_startup_context)
         self.success = False
         self._lock = threading.RLock()
-        self._temp = tempfile.TemporaryDirectory(prefix="capcut-chromium-")
+        self._temp = tempfile.TemporaryDirectory(prefix="capcut-chrome-154-")
         self.profile_dir = Path(self._temp.name).resolve()
         self.process = None
         self._closed = False
@@ -112,9 +117,9 @@ class ChromiumSession:
             deadline = time.monotonic() + 20
             while time.monotonic() < deadline:
                 if stop_event is not None and stop_event.is_set():
-                    raise RuntimeError("Đã dừng mở Chromium 154")
+                    raise RuntimeError("Đã dừng mở Google Chrome")
                 if self.process.poll() is not None:
-                    raise RuntimeError("Chromium 154 đã thoát trước khi sẵn sàng")
+                    raise RuntimeError("Google Chrome đã thoát trước khi sẵn sàng")
                 try:
                     port = int((self.profile_dir / "DevToolsActivePort").read_text().splitlines()[0])
                     address = f"127.0.0.1:{port}"
@@ -125,12 +130,12 @@ class ChromiumSession:
                     continue
                 actual_major = version.split("/")[-1].split(".")[0]
                 if expected_major is not None and actual_major != str(expected_major):
-                    raise RuntimeError(f"Cần Chromium {expected_major}, trình duyệt hiện tại là {version}")
+                    raise RuntimeError(f"Cần Chrome {expected_major}, trình duyệt hiện tại là {version}")
                 self.browser_version = version
                 self.remote_debugging_address = self.browser_location = address
                 self.success = True
                 return
-            raise RuntimeError("Chromium 154 không mở được cổng điều khiển")
+            raise RuntimeError("Google Chrome không mở được cổng điều khiển")
         except BaseException:
             self.close()
             raise
@@ -179,10 +184,6 @@ class ChromiumSession:
 def open_workflow_page(browser, context):
     session = (context or {}).get("start_result")
     if getattr(session, "reuse_startup_context", False):
-        if session.proxy and session.proxy.get("username"):
-            raise RuntimeError(
-                "Reg treo dùng Chrome hệ thống không hỗ trợ proxy có username/password"
-            )
         browser_context = next(
             (candidate for candidate in browser.contexts if candidate.pages),
             browser.contexts[0] if browser.contexts else None,

@@ -11,6 +11,7 @@ import tkinter as tk
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+from urllib.parse import urlsplit, urlunsplit
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
@@ -35,9 +36,34 @@ def load_app_version() -> str:
 
 APP_VERSION = load_app_version()
 APP_TITLE = f"Reg CapCut v{APP_VERSION}"
+# A 5-slot CapCut package has one owner and up to four invited accounts.
+ADD_LINK_MEMBER_LIMIT = 4
+TWO_SLOT_MEMBER_LIMIT = 1
+
+
+def normalize_add_link(value: str) -> str:
+    """Canonicalize an invitation URL so a trailing slash is not a second link."""
+    raw = str(value or "").strip()
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return ""
+    if parsed.scheme.casefold() not in {"http", "https"} or not parsed.hostname:
+        return ""
+    path = parsed.path.rstrip("/")
+    return urlunsplit((parsed.scheme.casefold(), parsed.netloc.casefold(), path, parsed.query, ""))
+
+
+def link_member_limit(limits: dict | None, link: str) -> int:
+    """Return the saved capacity for an invitation, defaulting to a 5-slot space."""
+    try:
+        value = int((limits or {}).get(link, ADD_LINK_MEMBER_LIMIT))
+    except (TypeError, ValueError):
+        value = ADD_LINK_MEMBER_LIMIT
+    return max(TWO_SLOT_MEMBER_LIMIT, min(ADD_LINK_MEMBER_LIMIT, value))
 
 from core.settings import load_settings, save_settings
-from modules.browser.chromium import ChromiumSession, resolve_chromium_154, resolve_installed_chrome, parse_browser_proxy
+from modules.browser.chromium import CHROME_MAJOR_VERSION, ChromiumSession, resolve_chromium_154
 from modules.actions.capcut_workflow import (
     CAPCUT_SIGN_UP_URL,
     CapCutWorkflowInterrupted,
@@ -55,7 +81,6 @@ from modules.actions.capcut_add_link import (
     run_capcut_check_user_workflow,
     run_capcut_login_hold_workflow,
 )
-from modules.proxy.thuecloud import ThueCloudClient, parse_static_proxy_line, reset_change_ip_url
 from modules.proxy.expressvpn import ExpressVPNController, ExpressVPNError
 from modules.storage.google_sheets import append_success_rows
 from modules.ui.capcut_space_check import CheckSpaceMixin
@@ -65,7 +90,7 @@ def _add_link_assignment(account: dict) -> str:
     """A failed login without a pending Submit has not used its invitation."""
     if account.get("status") == "login fail" and not account.get("join_pending"):
         return ""
-    return account.get("assigned_link") or ""
+    return normalize_add_link(account.get("assigned_link", ""))
 
 
 def build_tab(app) -> None:
@@ -155,14 +180,19 @@ def parse_add_link_line(line: str) -> tuple[str, int] | None:
     candidate, separator, raw_count = value.rpartition("|")
     if separator and raw_count.strip().isdigit():
         link = candidate.strip()
-        count = min(6, max(0, int(raw_count.strip())))
+        count = min(ADD_LINK_MEMBER_LIMIT, max(0, int(raw_count.strip())))
 
-    if not link.lower().startswith(("http://", "https://")):
+    link = normalize_add_link(link)
+    if not link:
         return None
     return link, count
 
 
-def assign_links(accounts: list[dict], links: list[str], accounts_per_link: int = 6) -> list[tuple[dict, str]]:
+def assign_links(
+    accounts: list[dict],
+    links: list[str],
+    accounts_per_link: int = ADD_LINK_MEMBER_LIMIT,
+) -> list[tuple[dict, str]]:
     if accounts_per_link < 1:
         raise ValueError("accounts_per_link must be at least 1")
     capacity = len(links) * accounts_per_link
@@ -235,10 +265,11 @@ def write_result(account: dict, success: bool, export_lock, export_dir: Path | s
     }
 
 
-def status_text(accounts: list[dict], proxy_count: int) -> str:
+def status_text(accounts: list[dict], proxy_count: int | None = None) -> str:
     created_count = sum(1 for account in accounts if account.get("status") == "true")
     failed_count = sum(1 for account in accounts if "fail" in str(account.get("status", "")).lower())
-    return f"Loaded: {len(accounts)} accounts | Created: {created_count} | Failed: {failed_count} | Proxy: {proxy_count}"
+    text = f"Loaded: {len(accounts)} accounts | Created: {created_count} | Failed: {failed_count}"
+    return text if proxy_count is None else f"{text} | Proxy: {proxy_count}"
 
 
 class RegCapCutWriter:
@@ -333,9 +364,7 @@ class RegCapCutApp(CheckSpaceMixin):
         self.output_queue = queue.Queue()
         self.app_settings = load_settings()
         self.accounts_path = Path("account.txt")
-        self.proxy_path = Path("proxy.txt")
         self.accounts = []
-        self.proxies = []
         self.add_link_accounts_path = Path("account.txt")
         self.add_link_links_path = Path("link.txt")
         self.add_link_accounts = []
@@ -353,6 +382,7 @@ class RegCapCutApp(CheckSpaceMixin):
         self.add_link_selected = set()
         self.add_link_run_links = []
         self.add_link_counts = {}
+        self.add_link_limits = {}
         self.add_link_counts_lock = threading.Lock()
         self.add_link_export_path = Path("export") / "add_link_used.txt"
         self.add_link_remaining_path = Path("export") / "add_link_remaining.txt"
@@ -474,7 +504,6 @@ class RegCapCutApp(CheckSpaceMixin):
         bar = tk.Frame(reg_tab, bg="#ffffff", relief="solid", borderwidth=1)
         bar.pack(fill="x", pady=(0, 8))
         self.tool_button(bar, "Import Mail", self.import_accounts, "#00a884", "#ffffff").pack(side="left", padx=8, pady=6)
-        self.tool_button(bar, "Import Proxy", self.import_proxies, "#0891b2", "#ffffff").pack(side="left", padx=4, pady=6)
         tk.Label(bar, text="Pass CapCut", bg="#ffffff").pack(side="left", padx=(12, 4), pady=6)
         self.passnew_entry = tk.Entry(bar, width=24, relief="solid", borderwidth=1, takefocus=0)
         self.passnew_entry.insert(0, "1234567")
@@ -534,7 +563,7 @@ class RegCapCutApp(CheckSpaceMixin):
         self.reg_account_tree.bind("<ButtonPress-1>", self._reg_account_press)
         self.reg_account_tree.bind("<B1-Motion>", self._reg_account_drag)
 
-        self.status_label = tk.Label(reg_tab, text=status_text(self.accounts, len(self.proxies)), bg="#f3f4f7", fg="#111827", font=("Tahoma", 10, "bold"))
+        self.status_label = tk.Label(reg_tab, text=status_text(self.accounts), bg="#f3f4f7", fg="#111827", font=("Tahoma", 10, "bold"))
         self.status_label.pack(anchor="w", padx=4, pady=(4, 8))
 
         self.build_add_link_tab(add_link_tab)
@@ -548,7 +577,6 @@ class RegCapCutApp(CheckSpaceMixin):
         self.tool_button(bar, "Nhập tài khoản", self.import_add_link_accounts, "#00a884", "#ffffff").pack(side="left", padx=8, pady=6)
         self.tool_button(bar, "Nhập link", self.import_add_link_links, "#0891b2", "#ffffff").pack(side="left", padx=4, pady=6)
         self.tool_button(bar, "Danh sách link", self.show_add_link_statistics, "#2563eb", "#ffffff").pack(side="left", padx=4, pady=6)
-        self.tool_button(bar, "Nhập proxy", self.import_proxies, "#64748b", "#ffffff").pack(side="left", padx=4, pady=6)
         tk.Label(bar, text="Số luồng", bg="#ffffff").pack(side="left", padx=(12, 4), pady=6)
         self.add_link_threads_entry = tk.Entry(bar, width=6, relief="solid", borderwidth=1, takefocus=0)
         self.add_link_threads_entry.insert(0, "3")
@@ -561,7 +589,8 @@ class RegCapCutApp(CheckSpaceMixin):
         self.add_link_delay_entry.insert(0, "1")
         self.add_link_delay_entry.pack(side="left", pady=6)
         self.add_link_delay_entry.bind("<FocusOut>", self._entry_lost_focus)
-        self.tool_button(bar, "Bắt đầu", self.start_add_link, "#059669", "#ffffff").pack(side="left", padx=4, pady=6)
+        self.tool_button(bar, "Add link 5 slot", self.start_add_link, "#059669", "#ffffff").pack(side="left", padx=4, pady=6)
+        self.tool_button(bar, "Add link 2 slot", self.start_add_link_two_slot, "#0f766e", "#ffffff").pack(side="left", padx=4, pady=6)
         self.tool_button(bar, "Dừng", self.stop, "#dc2626", "#ffffff").pack(side="left", padx=4, pady=6)
         check_buttons = tk.Frame(bar, bg="#ffffff")
         check_buttons.pack(side="right", padx=(4, 8), pady=6)
@@ -578,7 +607,11 @@ class RegCapCutApp(CheckSpaceMixin):
 
         tk.Label(
             parent,
-            text="Tài khoản: email|mật_khẩu_capcut  •  Link: mỗi dòng một link  •  Tối đa: 6 tài khoản cho mỗi link",
+            text=(
+                "Tài khoản: email|mật_khẩu_capcut  •  Link: mỗi dòng một link  •  "
+                f"Gói 5 slot: thêm {ADD_LINK_MEMBER_LIMIT} tài khoản/link  •  "
+                f"Gói 2 slot: thêm {TWO_SLOT_MEMBER_LIMIT} tài khoản/link"
+            ),
             bg="#f3f4f7",
             fg="#475569",
         ).pack(anchor="w", padx=4, pady=(0, 6))
@@ -850,8 +883,9 @@ class RegCapCutApp(CheckSpaceMixin):
         except (OSError, ValueError, TypeError):
             return {}
 
-    def _save_add_link_account_state(self):
+    def _save_add_link_account_state(self, *, overwrite_users=()):
         self.add_link_account_state_path.parent.mkdir(exist_ok=True)
+        overwrite_users = {str(user).casefold() for user in overwrite_users}
         with self.add_link_result_lock:
             # Retain history even when an account is removed from the table or
             # another file is imported. Snapshot under the write lock so an
@@ -860,7 +894,7 @@ class RegCapCutApp(CheckSpaceMixin):
             for account in self.add_link_accounts:
                 key = account["user"].casefold()
                 previous = payload.get(key, {})
-                if isinstance(previous, dict):
+                if isinstance(previous, dict) and key not in overwrite_users:
                     if previous.get("status") == "true":
                         account["status"] = "true"
                     if _add_link_assignment(previous):
@@ -909,7 +943,13 @@ class RegCapCutApp(CheckSpaceMixin):
                     {
                         "url": link,
                         "selected": link in self.add_link_selected,
-                        "count": min(6, max(0, int(self.add_link_counts.get(link, 0)))),
+                        "count": min(
+                            ADD_LINK_MEMBER_LIMIT,
+                            max(0, int(self.add_link_counts.get(link, 0))),
+                        ),
+                        "limit": link_member_limit(
+                            getattr(self, "add_link_limits", {}), link
+                        ),
                         "full": link in self.add_link_full,
                         "errors": list(self.add_link_errors.get(link, [])),
                     }
@@ -987,27 +1027,32 @@ class RegCapCutApp(CheckSpaceMixin):
         links = []
         selected_links = set()
         counts = {}
+        limits = {}
         errors = {}
         full_links = set()
         seen_links = set()
         for item in data.get("links", []):
             if not isinstance(item, dict):
                 continue
-            link = str(item.get("url", "")).strip()
+            link = normalize_add_link(item.get("url", ""))
             if not link or link in seen_links:
                 continue
             seen_links.add(link)
             links.append(link)
             try:
-                count = min(6, max(0, int(item.get("count", 0))))
+                count = min(
+                    ADD_LINK_MEMBER_LIMIT,
+                    max(0, int(item.get("count", 0))),
+                )
             except (TypeError, ValueError):
                 count = 0
             counts[link] = count
+            limits[link] = link_member_limit({link: item.get("limit")}, link)
             raw_errors = item.get("errors", [])
             errors[link] = [str(error) for error in raw_errors] if isinstance(raw_errors, list) else []
             if item.get("selected", True):
                 selected_links.add(link)
-            if item.get("full", False) or count >= 6:
+            if item.get("full", False) or count >= limits[link]:
                 full_links.add(link)
 
         self.add_link_accounts = accounts
@@ -1016,9 +1061,14 @@ class RegCapCutApp(CheckSpaceMixin):
         self.add_link_links = links
         self.add_link_selected = selected_links
         self.add_link_counts = counts
+        self.add_link_limits = limits
         self.add_link_errors = errors
         self.add_link_full = full_links
         self.refresh_add_link_status()
+        # Older releases used six invite slots and can leave a stale remaining
+        # file behind. Rewrite exports after restoring with the current limits.
+        if hasattr(self, "add_link_export_path") and hasattr(self, "add_link_counts_lock"):
+            self.write_add_link_results()
         print(
             f"[CAPCUT][ADD LINK] Restored user workspace: "
             f"{len(accounts)} accounts | {len(links)} links"
@@ -1246,11 +1296,13 @@ class RegCapCutApp(CheckSpaceMixin):
         rows = tuple(preserve_rows or tree.selection())
         with self.add_link_counts_lock:
             counts = dict(self.add_link_counts)
-            full_links = set(self.add_link_full)
+            full_links = set(getattr(self, "add_link_full", set()))
+            limits = dict(getattr(self, "add_link_limits", {}))
         tree.delete(*tree.get_children())
         for index, link in enumerate(self.add_link_links):
-            joined = min(6, counts.get(link, 0))
-            remaining = max(0, 6 - joined)
+            limit = link_member_limit(limits, link)
+            joined = min(limit, counts.get(link, 0))
+            remaining = 0 if link in full_links else max(0, limit - joined)
             status = "Đã đầy" if link in full_links or remaining == 0 else ("Đã dùng một phần" if joined else "Chưa sử dụng")
             tree.insert(
                 "",
@@ -1268,8 +1320,17 @@ class RegCapCutApp(CheckSpaceMixin):
         if valid_rows:
             tree.selection_set(valid_rows)
         selected_count = sum(1 for link in self.add_link_links if link in self.add_link_selected)
-        remaining_links = sum(1 for link in self.add_link_links if counts.get(link, 0) < 6)
-        remaining_slots = sum(max(0, 6 - min(6, counts.get(link, 0))) for link in self.add_link_links)
+        remaining_links = sum(
+            1 for link in self.add_link_links
+            if link not in full_links
+            and counts.get(link, 0) < link_member_limit(limits, link)
+        )
+        remaining_slots = sum(
+            0
+            if link in full_links
+            else max(0, link_member_limit(limits, link) - counts.get(link, 0))
+            for link in self.add_link_links
+        )
         self.add_link_stats_summary.configure(
             text=f"Tổng số link: {len(self.add_link_links)} | Đã chọn: {selected_count} | Link còn dùng được: {remaining_links} | Tổng lượt còn lại: {remaining_slots}"
         )
@@ -1305,9 +1366,9 @@ class RegCapCutApp(CheckSpaceMixin):
 
         body = tk.Frame(self.settings_window, bg="#ffffff", relief="solid", borderwidth=1)
         body.pack(fill="both", expand=True, padx=12, pady=12)
-        tk.Label(body, text="Chromium 154 ẩn danh", bg="#ffffff", fg="#111827", font=("Tahoma", 10, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 8))
+        tk.Label(body, text="Chrome 154 • chế độ ẩn danh", bg="#ffffff", fg="#111827", font=("Tahoma", 10, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 8))
 
-        fields = (("expressvpn_path", "ExpressVPN"), ("chromium_path", "Chromium 154"))
+        fields = (("expressvpn_path", "ExpressVPN"), ("chromium_path", "Chrome 154"))
         self.settings_entries = {}
         for index, (key, label) in enumerate(fields, start=1):
             tk.Label(body, text=label, bg="#ffffff", fg="#334155").grid(row=index, column=0, sticky="w", padx=10, pady=5)
@@ -1339,7 +1400,7 @@ class RegCapCutApp(CheckSpaceMixin):
         try:
             save_settings(self.app_settings)
             self.app_settings = load_settings()
-            print("Đã lưu cài đặt Chromium 154")
+            print("Đã lưu cài đặt Chrome 154")
             self.close_settings_window()
         except Exception as exc:
             messagebox.showerror("Settings", f"Could not save settings: {exc}")
@@ -1516,6 +1577,7 @@ class RegCapCutApp(CheckSpaceMixin):
         with self.add_link_counts_lock:
             previous_counts = self.add_link_counts
             previous_errors = self.add_link_errors
+            previous_limits = getattr(self, "add_link_limits", {})
             # Preserve progress already known by the workspace. A count explicitly
             # imported from add_link_used.txt can only move that progress forward.
             self.add_link_counts = {
@@ -1527,9 +1589,13 @@ class RegCapCutApp(CheckSpaceMixin):
                 for link in loaded
             }
             self.add_link_errors = {link: list(previous_errors.get(link, [])) for link in loaded}
+            self.add_link_limits = {
+                link: link_member_limit(previous_limits, link) for link in loaded
+            }
             self.add_link_full.intersection_update(loaded)
             self.add_link_full.update(
-                link for link, count in self.add_link_counts.items() if count >= 6
+                link for link, count in self.add_link_counts.items()
+                if count >= link_member_limit(self.add_link_limits, link)
             )
         self._save_add_link_workspace()
         self.refresh_add_link_status()
@@ -1582,7 +1648,11 @@ class RegCapCutApp(CheckSpaceMixin):
 
     def refresh_add_link_status(self):
         joined = sum(self.add_link_counts.values())
-        capacity = len(self.add_link_links) * 6
+        limits = getattr(self, "add_link_limits", {})
+        full_links = set(self.add_link_full)
+        capacity = sum(
+            link_member_limit(limits, link) for link in self.add_link_links
+        )
         selected_links = getattr(self, "add_link_selected", set(self.add_link_links))
         selected_count = sum(1 for link in self.add_link_links if link in selected_links)
         selected_accounts = sum(
@@ -1591,9 +1661,20 @@ class RegCapCutApp(CheckSpaceMixin):
             if account["user"].casefold() in self.add_link_account_selected
         )
         remaining_links = sum(
-            1 for link in self.add_link_links if self.add_link_counts.get(link, 0) < 6
+            1
+            for link in self.add_link_links
+            if link not in full_links
+            and self.add_link_counts.get(link, 0) < link_member_limit(limits, link)
         )
-        remaining_slots = max(0, capacity - joined)
+        remaining_slots = sum(
+            0
+            if link in full_links
+            else max(
+                0,
+                link_member_limit(limits, link) - self.add_link_counts.get(link, 0),
+            )
+            for link in self.add_link_links
+        )
         # CapCut Pro counts
         pro_count = sum(1 for account in self.add_link_accounts if account.get("pro_status") == "true")
         not_pro_count = sum(1 for account in self.add_link_accounts if account.get("pro_status") in {"false", "error"})
@@ -1609,41 +1690,8 @@ class RegCapCutApp(CheckSpaceMixin):
         if hasattr(self, "check_pro_status_label"):
             self.refresh_check_pro_status()
 
-    def import_proxies(self):
-        path = filedialog.askopenfilename(
-            title="Open proxy.txt",
-            initialdir=str(Path.cwd()),
-            initialfile="proxy.txt",
-            filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")],
-        )
-        if not path:
-            return
-        self.proxy_path = Path(path)
-        self.load_proxies()
-
-    def load_proxies(self):
-        if not self.proxy_path.exists():
-            messagebox.showinfo("Info", f"File not found: {self.proxy_path}")
-            return
-        loaded = []
-        skipped = 0
-        for line in self.proxy_path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                loaded.append(parse_static_proxy_line(line))
-            except ValueError as exc:
-                skipped += 1
-                print(f"Skipped proxy line: {exc}")
-        self.proxies = loaded
-        self.refresh_status()
-        print(f"Loaded {len(self.proxies)} proxies from {self.proxy_path.name}")
-        if skipped:
-            print(f"Skipped {skipped} invalid proxy lines")
-
     def refresh_status(self):
-        self.status_label.configure(text=status_text(self.accounts, len(self.proxies)))
+        self.status_label.configure(text=status_text(self.accounts))
         self.render_reg_accounts()
 
     def render_reg_accounts(self):
@@ -1904,9 +1952,6 @@ class RegCapCutApp(CheckSpaceMixin):
         semaphore = threading.Semaphore(max_threads)
         workers = []
         total = len(self.check_pro_accounts)
-        if self.proxies:
-            print(f"[CAPCUT][CHECK PRO] Using {len(self.proxies)} imported proxies for {max_threads} threads")
-            self.reset_loaded_proxy_ips()
         for batch_start in range(0, total, 10):
             batch = self.check_pro_accounts[batch_start:batch_start + 10]
             workers = []
@@ -2012,7 +2057,14 @@ class RegCapCutApp(CheckSpaceMixin):
                 file.write(f'{account["user"]}|{account["passnew"]}\n')
                 file.flush()
 
-    def start_add_link(self):
+    def start_add_link_two_slot(self):
+        self.start_add_link(member_limit=TWO_SLOT_MEMBER_LIMIT)
+
+    def start_add_link(self, member_limit=ADD_LINK_MEMBER_LIMIT):
+        member_limit = max(
+            TWO_SLOT_MEMBER_LIMIT,
+            min(ADD_LINK_MEMBER_LIMIT, int(member_limit)),
+        )
         if self.task_thread and self.task_thread.is_alive():
             messagebox.showinfo("Thông báo", "Một tác vụ CapCut đang chạy")
             return
@@ -2044,28 +2096,43 @@ class RegCapCutApp(CheckSpaceMixin):
         self.add_link_run_accounts = [
             account for account in self.add_link_accounts
             if account["user"].casefold() in selected_accounts
-            and account.get("status") != "true"
-            and (not _add_link_assignment(account) or _add_link_assignment(account) in self.add_link_run_links)
         ]
         if not self.add_link_run_accounts:
-            messagebox.showinfo("Thông báo", "Không có tài khoản đã chọn phù hợp: tài khoản đã add thành công sẽ được bỏ qua; tài khoản đã phân link chỉ chạy lại link đó.")
+            messagebox.showinfo("Thông báo", "Hãy tích ít nhất một tài khoản trong Bảng acc thêm link")
             return
         for account in self.add_link_run_accounts:
-            account["assigned_link"] = _add_link_assignment(account)
+            # Explicitly selecting an account and pressing Start begins a new
+            # assignment. Clear durable results from older runs so completed or
+            # previously assigned rows can be used with the links selected now.
+            account["assigned_link"] = ""
+            account["join_pending"] = False
             account["status"] = ""
-        self._save_add_link_account_state()
+        self._save_add_link_account_state(
+            overwrite_users={account["user"] for account in self.add_link_run_accounts}
+        )
         with self.add_link_counts_lock:
             # Counts are cumulative per invitation and are persisted in workspace.json.
             # Resetting them here made the table forget every previous successful join
             # whenever Start was pressed again.
             self.add_link_counts = {
-                link: min(6, max(0, int(self.add_link_counts.get(link, 0))))
+                link: min(
+                    ADD_LINK_MEMBER_LIMIT,
+                    max(0, int(self.add_link_counts.get(link, 0))),
+                )
                 for link in self.add_link_links
             }
+            limits = dict(getattr(self, "add_link_limits", {}))
+            for link in self.add_link_links:
+                limits.setdefault(link, ADD_LINK_MEMBER_LIMIT)
+            for link in self.add_link_run_links:
+                limits[link] = member_limit
+            self.add_link_limits = limits
             self.add_link_errors = {link: [] for link in self.add_link_links}
             self.add_link_full.intersection_update(self.add_link_links)
+            self.add_link_full.difference_update(self.add_link_run_links)
             self.add_link_full.update(
-                link for link, count in self.add_link_counts.items() if count >= 6
+                link for link, count in self.add_link_counts.items()
+                if count >= link_member_limit(self.add_link_limits, link)
             )
             self.add_link_success_path.parent.mkdir(exist_ok=True)
             self.add_link_success_path.write_text("", encoding="utf-8")
@@ -2077,12 +2144,21 @@ class RegCapCutApp(CheckSpaceMixin):
         self.refresh_add_link_status()
         self.task_thread = threading.Thread(
             target=self.run_add_link_accounts,
-            args=(max_threads, launch_delay),
+            args=(max_threads, launch_delay, member_limit),
             daemon=True,
         )
         self.task_thread.start()
 
-    def run_add_link_accounts(self, max_threads, launch_delay):
+    def run_add_link_accounts(
+        self,
+        max_threads,
+        launch_delay,
+        member_limit=ADD_LINK_MEMBER_LIMIT,
+    ):
+        member_limit = max(
+            TWO_SLOT_MEMBER_LIMIT,
+            min(ADD_LINK_MEMBER_LIMIT, int(member_limit)),
+        )
         group_name = self.selected_group_name()
         semaphore = threading.Semaphore(max_threads)
         run_links = list(getattr(self, "add_link_run_links", None) or self.add_link_links)
@@ -2100,25 +2176,29 @@ class RegCapCutApp(CheckSpaceMixin):
         total = len(pending)
         print(
             f"[CAPCUT][ADD LINK][RUN] Starting: accounts={total} | links={len(run_links)} | "
-            f"threads={max_threads} | launch_delay={launch_delay}s"
+            f"threads={max_threads} | launch_delay={launch_delay}s | "
+            f"accounts_per_link={member_limit}"
         )
         account_index = 0
         link_index = 0
         running = []
-        if self.proxies:
-            print(f"[CAPCUT][ADD LINK] Using {len(self.proxies)} imported proxies for {max_threads} threads")
-            self.reset_loaded_proxy_ips()
         while not self.stop_event.is_set() and pending and link_index < len(run_links):
             running = [item for item in running if item[0].is_alive()]
             link = run_links[link_index]
             with self.add_link_counts_lock:
                 success_count = self.add_link_counts[link]
             in_flight = sum(1 for _, active_link in running if active_link == link)
-            if success_count >= 6:
-                print(f"[CAPCUT][ADD LINK][SCHEDULER] Link already full ({success_count}/6), skipping: {link}")
+            if success_count >= member_limit:
+                print(
+                    f"[CAPCUT][ADD LINK][SCHEDULER] Link already full "
+                    f"({success_count}/{member_limit}), skipping: {link}"
+                )
                 link_index += 1
                 continue
-            if len(running) >= max_threads or success_count + in_flight >= 6:
+            if (
+                len(running) >= max_threads
+                or success_count + in_flight >= member_limit
+            ):
                 time.sleep(0.1)
                 continue
 
@@ -2134,11 +2214,21 @@ class RegCapCutApp(CheckSpaceMixin):
             account_index += 1
             print(
                 f"[CAPCUT][ADD LINK][SCHEDULER] Assigning {account['user']} -> {link} | "
-                f"count={success_count}/6 | in_flight={in_flight} | pending_accounts={len(pending)}"
+                f"count={success_count}/{member_limit} | "
+                f"in_flight={in_flight} | pending_accounts={len(pending)}"
             )
             worker = threading.Thread(
                 target=self.run_add_link_worker,
-                args=(account, link, group_name, index, total, semaphore, max_threads),
+                args=(
+                    account,
+                    link,
+                    group_name,
+                    index,
+                    total,
+                    semaphore,
+                    max_threads,
+                    member_limit,
+                ),
                 daemon=True,
             )
             running.append((worker, link))
@@ -2163,7 +2253,17 @@ class RegCapCutApp(CheckSpaceMixin):
         self.current_accounts = []
         self.task_thread = None
 
-    def run_add_link_worker(self, account, link, group_name, index, total, semaphore, max_threads):
+    def run_add_link_worker(
+        self,
+        account,
+        link,
+        group_name,
+        index,
+        total,
+        semaphore,
+        max_threads,
+        member_limit=ADD_LINK_MEMBER_LIMIT,
+    ):
         with semaphore:
             print(
                 f"[CAPCUT][ADD LINK][WORKER] Started {index + 1}/{total}: "
@@ -2201,11 +2301,11 @@ class RegCapCutApp(CheckSpaceMixin):
                     self.root.after(0, self.refresh_add_link_status)
                 except RuntimeError:
                     pass
-                standalone_process, result = self._start_account_browser(
-                    account, index, max_threads, startup_url=CAPCUT_LOGIN_URL,
+                standalone_process, result = self._start_add_link_browser(
+                    account, index, max_threads
                 )
                 print(
-                    f"[CAPCUT][ADD LINK][BROWSER] Chromium 154 ready: {account['user']} | "
+                    f"[CAPCUT][ADD LINK][BROWSER] Chrome 154 ready: {account['user']} | "
                     f"address={getattr(result, 'remote_debugging_address', 'unknown')}"
                 )
                 workflow_ok = run_capcut_add_link_workflow(
@@ -2227,11 +2327,16 @@ class RegCapCutApp(CheckSpaceMixin):
                         print(f'[CAPCUT][ADD LINK] Success confirmed after link was marked full: {account["user"]} -> {link}')
                         return
                     account["status"] = "true"
-                    self.add_link_counts[link] = min(6, self.add_link_counts[link] + 1)
+                    self.add_link_counts[link] = min(
+                        member_limit,
+                        self.add_link_counts[link] + 1,
+                    )
+                    if self.add_link_counts[link] >= member_limit:
+                        self.add_link_full.add(link)
                     self.write_add_link_results(lock_held=True)
                     print(
                         f"[CAPCUT][ADD LINK][RESULT] Updated link count: "
-                        f"{self.add_link_counts[link]}/6 | {link}"
+                        f"{self.add_link_counts[link]}/{member_limit} | {link}"
                     )
                 try:
                     self.root.after(0, self.refresh_add_link_status)
@@ -2251,7 +2356,10 @@ class RegCapCutApp(CheckSpaceMixin):
                 account["status"] = "link full"
                 with self.add_link_counts_lock:
                     self.add_link_full.add(link)
-                    self.add_link_counts[link] = 6
+                    self.add_link_counts[link] = min(
+                        ADD_LINK_MEMBER_LIMIT,
+                        max(self.add_link_counts.get(link, 0), member_limit),
+                    )
                     self.write_add_link_results(lock_held=True)
                 print(f'[CAPCUT][ADD LINK] Can\'t submit request; marked link full and skipped: {link}')
             except CannotJoinSpaceError as exc:
@@ -2297,11 +2405,13 @@ class RegCapCutApp(CheckSpaceMixin):
                     with self.active_profiles_lock:
                         self.active_profiles.pop(account["user"], None)
                     self._close_standalone_process(standalone_process)
-                    print(f"[CAPCUT][ADD LINK][BROWSER] Chromium 154 closed: {account['user']}")
+                    print(f"[CAPCUT][ADD LINK][BROWSER] Chrome 154 closed: {account['user']}")
 
     def write_add_link_results(self, lock_held=False):
         def write_file():
             self.add_link_export_path.parent.mkdir(exist_ok=True)
+            limits = getattr(self, "add_link_limits", {})
+            full_links = set(getattr(self, "add_link_full", set()))
             # Keep every imported link, including untouched links with count 0,
             # so stopping early never loses invitations that can still be used.
             lines = [
@@ -2315,9 +2425,10 @@ class RegCapCutApp(CheckSpaceMixin):
                 self.add_link_export_path.with_name("add_link_remaining.txt"),
             )
             remaining_lines = [
-                f"{link}|{6 - min(6, count)}"
+                f"{link}|{link_member_limit(limits, link) - min(link_member_limit(limits, link), count)}"
                 for link, count in self.add_link_counts.items()
-                if count < 6
+                if link not in full_links
+                and count < link_member_limit(limits, link)
             ]
             remaining_path.write_text("\n".join(remaining_lines), encoding="utf-8")
             error_lines = [
@@ -2366,8 +2477,8 @@ class RegCapCutApp(CheckSpaceMixin):
         try:
             self._resolve_chromium_154_browser()
         except Exception as exc:
-            messagebox.showerror("Chromium 154", str(exc))
-            print(f"[REG CAPCUT] Chromium 154 preflight failed: {exc}")
+            messagebox.showerror("Chrome 154", str(exc))
+            print(f"[REG CAPCUT] Chrome 154 preflight failed: {exc}")
             return
         self.stop_event.clear()
         self.current_accounts = selected
@@ -2393,9 +2504,9 @@ class RegCapCutApp(CheckSpaceMixin):
             messagebox.showinfo("Thông báo", "Một tác vụ CapCut đang chạy")
             return
         try:
-            resolve_installed_chrome()
+            self._resolve_chromium_154_browser()
         except RuntimeError as exc:
-            messagebox.showerror("Google Chrome", str(exc))
+            messagebox.showerror("Chrome 154", str(exc))
             return
         try:
             threads = max(1, int(self.add_link_threads_entry.get().strip() or "1"))
@@ -2459,9 +2570,6 @@ class RegCapCutApp(CheckSpaceMixin):
         semaphore = threading.Semaphore(max_threads)
         workers = []
         total_accounts = len(accounts)
-        if self.proxies:
-            print(f"Using {len(self.proxies)} imported proxies for {max_threads} threads")
-            self.reset_loaded_proxy_ips()
         # Run in batches so an ExpressVPN reset never interrupts active browsers.
         for batch_start in range(0, total_accounts, 10):
             batch = accounts[batch_start:batch_start + 10]
@@ -2509,7 +2617,7 @@ class RegCapCutApp(CheckSpaceMixin):
                     self.mark_account_status(account, "stopped")
                     return
                 self.mark_account_status(account, "running")
-                standalone_process, result = self._start_account_browser(account, index, max_threads)
+                standalone_process, result = self._start_registration_browser(account, index, max_threads)
                 if self.stop_event.is_set():
                     self.mark_account_status(account, "stopped")
                     return
@@ -2567,13 +2675,13 @@ class RegCapCutApp(CheckSpaceMixin):
 
     def _start_standalone_chromium(self, account, index, browser_override=None,
                                    profile_root=None, startup_url=CAPCUT_SIGN_UP_URL,
-                                   raw_proxy="", max_threads=1, expected_major="154",
+                                   max_threads=1, expected_major=CHROME_MAJOR_VERSION,
                                    reuse_startup_context=False):
         # profile_root is accepted for compatibility; every session gets a fresh
         # temporary directory, never a reused account/index directory.
         session = ChromiumSession(
             browser_override or self._resolve_chromium_154_browser(),
-            stop_event=self.stop_event, raw_proxy=raw_proxy,
+            stop_event=self.stop_event,
             window_settings=self.app_settings.browser_window,
             index=index % max_threads, total_windows=max_threads,
             expected_major=expected_major,
@@ -2583,25 +2691,40 @@ class RegCapCutApp(CheckSpaceMixin):
             self.active_standalone_processes[str(session.profile_dir)] = session
         if self.stop_event.is_set():
             self._close_standalone_process(session)
-            raise CapCutWorkflowInterrupted("Đã dừng Chromium 154")
+            raise CapCutWorkflowInterrupted("Đã dừng Chrome 154")
         return session, session
 
-    def _start_account_browser(self, account, index, max_threads, startup_url=CAPCUT_SIGN_UP_URL):
-        proxy = self.proxy_for_worker(index, max_threads)
-        raw_proxy = self.get_account_raw_proxy(account, proxy)
-        if getattr(self, "hold_mode", False):
+    def _start_account_browser(self, account, index, max_threads,
+                               startup_url=CAPCUT_SIGN_UP_URL,
+                               reuse_startup_context=False):
+        if getattr(self, "hold_mode", False) or reuse_startup_context:
             return self._start_standalone_chromium(
                 account,
                 index,
-                browser_override=resolve_installed_chrome(),
-                raw_proxy=raw_proxy,
                 max_threads=max_threads,
-                expected_major=None,
                 reuse_startup_context=True,
             )
         return self._start_standalone_chromium(
-            account, index, raw_proxy=raw_proxy, max_threads=max_threads,
+            account, index, max_threads=max_threads,
             startup_url=startup_url,
+        )
+
+    def _start_add_link_browser(self, account, index, max_threads):
+        """Use Chrome's original incognito window for every Add Link mode."""
+        return self._start_account_browser(
+            account,
+            index,
+            max_threads,
+            startup_url=CAPCUT_LOGIN_URL,
+            reuse_startup_context=True,
+        )
+
+    def _start_registration_browser(self, account, index, max_threads):
+        """Start a disposable incognito session with the configured Chrome 154."""
+        return self._start_standalone_chromium(
+            account,
+            index,
+            max_threads=max_threads,
         )
 
     def _close_standalone_process(self, process):
@@ -2649,20 +2772,20 @@ class RegCapCutApp(CheckSpaceMixin):
         # The owned process is authoritative. A transient CDP error or empty
         # target list must never trigger worker cleanup and kill a live window.
         if callable(getattr(start_result, "poll", None)):
-            print(f"[REG TREO] Đang giữ cửa sổ cho {user}; đóng Chromium 154 bằng X để chạy tiếp")
+            print(f"[REG TREO] Đang giữ cửa sổ cho {user}; đóng Chrome 154 bằng X để chạy tiếp")
             while not self.stop_event.is_set() and start_result.poll() is None:
                 self.stop_event.wait(0.5)
             if not self.stop_event.is_set():
-                print(f"[REG TREO] Chromium 154 đã thoát cho {user}; chờ 3 giây")
+                print(f"[REG TREO] Chrome 154 đã thoát cho {user}; chờ 3 giây")
                 self.stop_event.wait(3)
             return
         address = str(getattr(start_result, "remote_debugging_address", "") or getattr(start_result, "browser_location", "") or "")
         match = re.search(r"(?:localhost|127\.0\.0\.1|(?:\d{1,3}\.){3}\d{1,3}):(\d+)", address)
         if not match:
-            print(f"[REG TREO] Không tìm thấy cổng Chromium 154 để theo dõi: {address}")
+            print(f"[REG TREO] Không tìm thấy cổng Chrome 154 để theo dõi: {address}")
             return
         port = int(match.group(1))
-        print(f"[REG TREO] Đang giữ cửa sổ cho {user}; đóng Chromium 154 bằng X để chạy tiếp")
+        print(f"[REG TREO] Đang giữ cửa sổ cho {user}; đóng Chrome 154 bằng X để chạy tiếp")
         while not self.stop_event.is_set():
             try:
                 with urlopen(f"http://127.0.0.1:{port}/json/list", timeout=1) as response:
@@ -2698,47 +2821,6 @@ class RegCapCutApp(CheckSpaceMixin):
     def selected_group_name(self):
         return "capcut"
 
-    def proxy_for_worker(self, index, max_threads):
-        if not self.proxies:
-            return None
-        active_slots = min(max_threads, max(1, len(self.current_accounts)))
-        slot = index % active_slots
-        proxy_index = min(len(self.proxies) - 1, (slot * len(self.proxies)) // active_slots)
-        return self.proxies[proxy_index]
-
-    def mask_proxy(self, raw_proxy):
-        try:
-            return (parse_browser_proxy(raw_proxy) or {}).get("server", "")
-        except RuntimeError:
-            return "<invalid proxy>"
-
-    def reset_loaded_proxy_ips(self):
-        seen = set()
-        for proxy in self.proxies:
-            if not proxy.change_ip_url or proxy.change_ip_url in seen:
-                continue
-            seen.add(proxy.change_ip_url)
-            masked_proxy = self.mask_proxy(proxy.raw_proxy)
-            print(f"Resetting proxy IP: {masked_proxy}")
-            try:
-                response = reset_change_ip_url(proxy.change_ip_url)
-                if response:
-                    print(f"Change-IP response for {masked_proxy}: {response[:200]}")
-            except Exception as exc:
-                print(f"Change-IP warning for {masked_proxy}: {exc}")
-
-    def get_account_raw_proxy(self, account, proxy=None):
-        if proxy is not None:
-            print(f'Attached imported proxy for {account["user"]}: {self.mask_proxy(proxy.raw_proxy)}')
-            return proxy.raw_proxy
-        if not self.app_settings.thuecloud.enabled:
-            return ""
-        raw_proxy = ThueCloudClient(self.app_settings.thuecloud).get_raw_proxy()
-        if not raw_proxy:
-            raise RuntimeError("ThueCloud returned empty proxy")
-        print(f'Attached ThueCloud proxy for {account["user"]}')
-        return raw_proxy
-
     def mark_account_status(self, account, status):
         with self.account_lock:
             account["status"] = status
@@ -2756,9 +2838,9 @@ class RegCapCutApp(CheckSpaceMixin):
         for user, process in standalone_to_close:
             try:
                 self._close_standalone_process(process)
-                print(f"Stop closed Chromium 154: {user}")
+                print(f"Stop closed Chrome 154: {user}")
             except Exception as exc:
-                print(f"Stop Chromium 154 warning for {user}: {exc}")
+                print(f"Stop Chrome 154 warning for {user}: {exc}")
         print("Stop requested")
 
     def drain(self):

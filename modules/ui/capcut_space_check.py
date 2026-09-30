@@ -185,8 +185,6 @@ class CheckSpaceMixin:
     def run_check_space_accounts(self, accounts, threads, delay, out_fam=False, check_fam_origin=False):
         operation = "CHECK GỐC FAM" if check_fam_origin else ("OUT FAM" if out_fam else "CHECK SPACE")
         try:
-            if self.proxies:
-                self.reset_loaded_proxy_ips()
             with ThreadPoolExecutor(max_workers=threads) as pool:
                 futures = []
                 for index, account in enumerate(accounts):
@@ -215,7 +213,17 @@ class CheckSpaceMixin:
                 raise CapCutWorkflowInterrupted("Stop requested")
             running = "Đang Check Gốc Fam" if check_fam_origin else ("Đang Out Fam" if out_fam else "Đang kiểm tra Space")
             self._set_space_status(user, running)
-            process, start = self._start_account_browser(account, index, threads, startup_url=CAPCUT_LOGIN_URL)
+            # Keep using the window Chrome opened with --incognito. Creating a
+            # On Windows 11, a second CDP browser context briefly shows the real
+            # incognito window, closes it, and replaces it with a normal-looking
+            # window even though that replacement context is off-the-record.
+            process, start = self._start_account_browser(
+                account,
+                index,
+                threads,
+                startup_url=CAPCUT_LOGIN_URL,
+                reuse_startup_context=True,
+            )
             workflow = (run_capcut_check_fam_origin_workflow if check_fam_origin else
                         (run_capcut_out_fam_workflow if out_fam else run_capcut_check_space_workflow))
             result = workflow(

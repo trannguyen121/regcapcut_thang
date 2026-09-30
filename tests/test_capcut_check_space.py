@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 
 from modules.actions.capcut_check_space import (
     SpaceCheckError, _all_pages, _teams_only, _owner_username, check_and_reduce_spaces,
-    check_owned_fam_members,
+    check_owned_fam_members, run_capcut_check_space_workflow,
     out_all_spaces,
 )
 from modules.ui.capcut_space_check import CheckSpaceMixin
@@ -34,6 +34,67 @@ class CheckSpaceTests(unittest.TestCase):
         result, api = self.run_flow([[space("a")]])
         self.assertEqual(result["after"], 1)
         api.assert_not_called()
+
+    def test_username_is_only_resolved_when_a_space_must_be_left(self):
+        resolver = Mock(side_effect=AssertionError("username was not needed"))
+        for spaces in ([], [space("a")]):
+            with patch("modules.actions.capcut_check_space._read_teams", return_value=spaces):
+                result = check_and_reduce_spaces(
+                    Mock(), {"user": "test@example.com"}, None, Mock(),
+                    resolve_member_username=resolver,
+                )
+            self.assertEqual(result["after"], len(spaces))
+        resolver.assert_not_called()
+
+        resolver = Mock(return_value="user111111111")
+        with (patch("modules.actions.capcut_check_space._read_teams",
+                    side_effect=[[space("a"), space("b")]] * 2 + [[space("a")]]),
+              patch("modules.actions.capcut_check_space._owner_username",
+                    return_value="user123456789"),
+              patch("modules.actions.capcut_check_space._call") as api,
+              patch("modules.actions.capcut_check_space._wait")):
+            result = check_and_reduce_spaces(
+                Mock(), {"user": "test@example.com"}, None, Mock(),
+                resolve_member_username=resolver,
+            )
+        resolver.assert_called_once_with()
+        api.assert_called_once()
+        self.assertEqual(result["after"], 1)
+
+    def test_check_space_workflow_skips_profile_lookup_for_no_teams(self):
+        account = {"user": "test@example.com"}
+        with (patch("modules.actions.capcut_check_space.sync_playwright"),
+              patch("modules.actions.capcut_check_space._cdp_url", return_value="http://localhost:9222"),
+              patch("modules.actions.capcut_check_space._connect_browser"),
+              patch("modules.actions.capcut_check_space.open_workflow_page") as open_page,
+              patch("modules.actions.capcut_check_space._login_with_email"),
+              patch("modules.actions.capcut_check_space._read_teams", return_value=[]),
+              patch("modules.actions.capcut_check_space.extract_capcut_username") as resolve,
+              patch("modules.actions.capcut_check_space._wait")):
+            result = run_capcut_check_space_workflow(account, {}, Mock())
+        self.assertEqual(result["status"], "no teams")
+        self.assertNotIn("userID", account)
+        resolve.assert_not_called()
+        open_page.return_value.goto.assert_called_once()
+
+    def test_worker_reuses_the_initial_incognito_window(self):
+        app = CheckSpaceMixin()
+        app.stop_event = threading.Event()
+        app._set_space_status = Mock()
+        app._record_space_event = Mock()
+        app._close_standalone_process = Mock()
+        app._start_account_browser = Mock(return_value=(Mock(), Mock()))
+        result = {"status": "no teams", "left": []}
+
+        with patch(
+            "modules.ui.capcut_space_check.run_capcut_check_space_workflow",
+            return_value=result,
+        ):
+            app.run_check_space_worker({"user": "mail@example.com"}, 0, 1)
+
+        self.assertTrue(
+            app._start_account_browser.call_args.kwargs["reuse_startup_context"]
+        )
 
     def test_zero_teams_is_not_claimed_as_one(self):
         result, api = self.run_flow([[]])

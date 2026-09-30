@@ -36,15 +36,24 @@ if errorlevel 1 (
 if not exist "dist\chrome-win\chrome.exe" (
     echo.
     echo ERROR: Khong tim thay dist\chrome-win\chrome.exe
-    echo Ban build da tao xong nhung chua co Chromium 154 de dong goi.
+    echo Ban build da tao xong nhung chua co Chrome 154 de dong goi.
     pause
     exit /b 1
 )
 
-echo Copying Chromium 154 into release folder...
+set "CHROME_VERSION="
+for /f "usebackq delims=" %%V in (`powershell -NoProfile -Command "(Get-Item -LiteralPath 'dist\chrome-win\chrome.exe').VersionInfo.FileVersion"`) do set "CHROME_VERSION=%%V"
+if not "%CHROME_VERSION:~0,4%"=="154." (
+    echo.
+    echo ERROR: dist\chrome-win\chrome.exe phai la Chrome 154, hien tai la %CHROME_VERSION%
+    pause
+    exit /b 1
+)
+
+echo Copying Chrome 154 into release folder...
 robocopy "dist\chrome-win" "dist\regcapcut_v%REGCAPCUT_VERSION%\chrome-154" /E /NFL /NDL /NJH /NJS /NP >nul
 if errorlevel 8 (
-    echo ERROR: Khong the sao chep Chromium 154 vao ban build
+    echo ERROR: Khong the sao chep Chrome 154 vao ban build
     pause
     exit /b 1
 )
