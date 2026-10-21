@@ -20,7 +20,7 @@ from modules.actions.workflow import SIGN_UP_URL, WorkflowInterrupted, run_workf
 from modules.proxy.thuecloud import ThueCloudClient, parse_static_proxy_line, reset_change_ip_url
 
 
-STABLE_BROWSER_VERSION = "142.0.7444.163"
+STABLE_BROWSER_VERSION = "154.0.8037.0"
 WINDOWS_CHROME_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/{browser_version} Safari/537.36"

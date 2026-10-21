@@ -202,7 +202,7 @@ class RegGrokWriter:
 
 
 class RegGrokApp:
-    STABLE_BROWSER_VERSION = "142.0.7444.163"
+    STABLE_BROWSER_VERSION = "154.0.8037.0"
     WINDOWS_CHROME_UA = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/{browser_version} Safari/537.36"

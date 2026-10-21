@@ -1,17 +1,18 @@
 import base64
+import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from playwright.sync_api import sync_playwright
 
 from core.orchestrator import Orchestrator
 from core.settings import BrowserWindowSettings
 from modules.browser.chromium import ChromiumSession, open_workflow_page, parse_browser_proxy, resolve_chromium_154
-from modules.ui.reg_capcut_tab import RegCapCutApp
+from modules.ui.reg_capcut_tab import RegCapCutApp, registration_proxy_for_account
 
 
 class ChromiumSessionTests(unittest.TestCase):
@@ -44,6 +45,80 @@ class ChromiumSessionTests(unittest.TestCase):
         self.assertIs(open_workflow_page(browser, {"start_result": session}), page)
         browser.new_context.assert_not_called()
         startup_context.new_page.assert_not_called()
+
+    def test_hold_configures_authenticated_proxy_on_startup_context(self):
+        page = Mock()
+        cdp = Mock()
+        startup_context = Mock()
+        startup_context.pages = [page]
+        startup_context.new_cdp_session.return_value = cdp
+        browser = Mock()
+        browser.contexts = [startup_context]
+        session = SimpleNamespace(
+            reuse_startup_context=True,
+            proxy={"server": "http://proxy:8080", "username": "user", "password": "secret"},
+        )
+
+        self.assertIs(open_workflow_page(browser, {"start_result": session}), page)
+        startup_context.new_cdp_session.assert_called_once_with(page)
+        cdp.send.assert_called_once_with("Fetch.enable", {"handleAuthRequests": True})
+        handlers = {entry.args[0]: entry.args[1] for entry in cdp.on.call_args_list}
+        handlers["Fetch.authRequired"]({
+            "requestId": "auth-1",
+            "authChallenge": {"source": "Proxy"},
+        })
+        self.assertEqual(
+            cdp.send.call_args,
+            call(
+                "Fetch.continueWithAuth",
+                {
+                    "requestId": "auth-1",
+                    "authChallengeResponse": {
+                        "response": "ProvideCredentials",
+                        "username": "user",
+                        "password": "secret",
+                    },
+                },
+            ),
+        )
+
+    def test_registration_proxies_are_split_evenly_by_account_order(self):
+        proxies = [SimpleNamespace(raw_proxy="proxy-1"), SimpleNamespace(raw_proxy="proxy-2")]
+        assigned = [
+            registration_proxy_for_account(proxies, index, 10).raw_proxy
+            for index in range(10)
+        ]
+        self.assertEqual(assigned, ["proxy-1"] * 5 + ["proxy-2"] * 5)
+
+    def test_registration_proxy_split_handles_uneven_account_count(self):
+        proxies = [SimpleNamespace(raw_proxy="proxy-1"), SimpleNamespace(raw_proxy="proxy-2")]
+        assigned = [
+            registration_proxy_for_account(proxies, index, 11).raw_proxy
+            for index in range(11)
+        ]
+        self.assertEqual(assigned.count("proxy-1"), 6)
+        self.assertEqual(assigned.count("proxy-2"), 5)
+
+    def test_reg_capcut_loads_and_validates_proxy_file(self):
+        app = RegCapCutApp.__new__(RegCapCutApp)
+        app.accounts = []
+        app.reg_account_tree = None
+        app.status_label = Mock()
+        with tempfile.TemporaryDirectory() as directory:
+            app.proxy_path = Path(directory) / "proxy.txt"
+            app.proxy_path.write_text(
+                "proxy-one:8080\nproxy-two:8081:user:secret\ninvalid\nproxy-one:8080\n",
+                encoding="utf-8",
+            )
+            app.load_proxies()
+
+        self.assertEqual(
+            [proxy.raw_proxy for proxy in app.proxies],
+            ["proxy-one:8080", "proxy-two:8081:user:secret"],
+        )
+        app.status_label.configure.assert_called_with(
+            text="Loaded: 0 accounts | Created: 0 | Failed: 0 | Proxy: 2"
+        )
 
     def test_workflow_page_rejects_a_regular_chrome_session(self):
         browser = Mock()
@@ -139,6 +214,7 @@ class ChromiumSessionTests(unittest.TestCase):
     def test_registration_uses_configured_chrome_154_incognito_session(self):
         app = RegCapCutApp.__new__(RegCapCutApp)
         account = {"user": "mail"}
+        app.hold_mode = False
         app._start_standalone_chromium = Mock(return_value=("process", "result"))
 
         result = app._start_registration_browser(account, 1, 3)
@@ -146,9 +222,55 @@ class ChromiumSessionTests(unittest.TestCase):
         self.assertEqual(result, ("process", "result"))
         kwargs = app._start_standalone_chromium.call_args.kwargs
         self.assertNotIn("browser_override", kwargs)
-        self.assertNotIn("raw_proxy", kwargs)
+        self.assertEqual(kwargs["raw_proxy"], "")
         self.assertEqual(kwargs["max_threads"], 3)
         self.assertNotIn("expected_major", kwargs)
+        self.assertFalse(kwargs["reuse_startup_context"])
+
+    def test_registration_hold_reuses_original_incognito_window(self):
+        app = RegCapCutApp.__new__(RegCapCutApp)
+        app.hold_mode = True
+        app._start_standalone_chromium = Mock(return_value=("process", "result"))
+
+        result = app._start_registration_browser({"user": "mail"}, 0, 2)
+
+        self.assertEqual(result, ("process", "result"))
+        self.assertTrue(
+            app._start_standalone_chromium.call_args.kwargs[
+                "reuse_startup_context"
+            ]
+        )
+        self.assertEqual(
+            app._start_standalone_chromium.call_args.kwargs["profile_root"],
+            Path("reg treo") / "chromium_profiles" / "1",
+        )
+
+    def test_registration_passes_assigned_proxy_to_chromium(self):
+        app = RegCapCutApp.__new__(RegCapCutApp)
+        app.hold_mode = True
+        app._start_standalone_chromium = Mock(return_value=("process", "result"))
+
+        app._start_registration_browser(
+            {"user": "mail", "registration_proxy": "proxy.local:8080:user:secret"},
+            0,
+            2,
+        )
+
+        kwargs = app._start_standalone_chromium.call_args.kwargs
+        self.assertEqual(kwargs["raw_proxy"], "proxy.local:8080:user:secret")
+        self.assertTrue(kwargs["reuse_startup_context"])
+
+    def test_registration_buttons_select_normal_or_hold_mode(self):
+        app = RegCapCutApp.__new__(RegCapCutApp)
+        app._start_registration = Mock()
+
+        app.start()
+        app.start_registration_hold()
+
+        self.assertEqual(
+            app._start_registration.call_args_list,
+            [call(hold_open=False), call(hold_open=True)],
+        )
 
     def test_standalone_browser_resolves_and_enforces_chrome_154(self):
         app = RegCapCutApp.__new__(RegCapCutApp)
@@ -167,6 +289,10 @@ class ChromiumSessionTests(unittest.TestCase):
         resolve.assert_called_once_with("custom-chrome")
         self.assertEqual(chromium_session.call_args.args[0], Path("chrome.exe"))
         self.assertEqual(chromium_session.call_args.kwargs["expected_major"], "154")
+        self.assertEqual(
+            chromium_session.call_args.kwargs["startup_url"],
+            "https://www.capcut.com/signup",
+        )
         self.assertIs(process, session)
         self.assertIs(result, session)
 
@@ -228,6 +354,41 @@ class ChromiumSessionTests(unittest.TestCase):
                 app.run_check_pro_worker({"user": "mail"}, "capcut", 0, 1, threading.Semaphore(1), 1)
         process.terminate.assert_called_once()
 
+    def test_yearly_check_writes_total_and_yearly_result_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            app = RegCapCutApp.__new__(RegCapCutApp)
+            app.stop_event = threading.Event()
+            app.active_profiles_lock = threading.Lock()
+            process = Mock()
+            app.active_standalone_processes = {"one": process}
+            app._start_account_browser = Mock(return_value=(process, object()))
+            app._save_add_link_account_state = Mock()
+            app.root = SimpleNamespace(after=lambda *args: None)
+            app.refresh_add_link_status = lambda: None
+            app.refresh_check_pro_status = lambda: None
+            app.check_pro_lock = threading.Lock()
+            app.check_pro_path = base / "capcut_pro.txt"
+            app.check_pro_yearly_path = base / "capcut_pro_yearly.txt"
+            app.check_pro_monthly_path = base / "capcut_pro_monthly.txt"
+            app.check_not_pro_path = base / "capcut_not_pro.txt"
+            account = {"user": "yearly@example.com", "passnew": "password"}
+
+            with patch(
+                "modules.ui.reg_capcut_tab.run_capcut_check_pro_workflow",
+                return_value="yearly",
+            ):
+                app.run_check_pro_worker(
+                    account, "capcut", 0, 1, threading.Semaphore(1), 1
+                )
+
+            self.assertEqual(account["pro_status"], "yearly")
+            expected = "yearly@example.com|password\n"
+            self.assertEqual(app.check_pro_path.read_text(encoding="utf-8"), expected)
+            self.assertEqual(app.check_pro_yearly_path.read_text(encoding="utf-8"), expected)
+            self.assertFalse(app.check_pro_monthly_path.exists())
+            process.terminate.assert_called_once()
+
 
 class ChromiumBrowserTests(unittest.TestCase):
     @classmethod
@@ -241,6 +402,10 @@ class ChromiumBrowserTests(unittest.TestCase):
         first = ChromiumSession(self.browser_path, headless=True)
         second = None
         try:
+            self.assertIn("--incognito", first.launch_args)
+            self.assertIn("--no-first-run", first.launch_args)
+            self.assertIn("--no-default-browser-check", first.launch_args)
+            self.assertIn("--disable-popup-blocking", first.launch_args)
             second = ChromiumSession(self.browser_path, headless=True)
             self.assertNotEqual(first.profile_dir, second.profile_dir)
             self.assertNotEqual(first.remote_debugging_address, second.remote_debugging_address)
@@ -270,6 +435,21 @@ class ChromiumBrowserTests(unittest.TestCase):
         self.assertFalse(first.profile_dir.exists())
         self.assertIsNotNone(first.poll())
         self.assertFalse(second.profile_dir.exists())
+
+    def test_v75_compatible_profile_is_retained_after_incognito_closes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = Path(directory) / "reg treo" / "chromium_profiles" / "1"
+            session = ChromiumSession(
+                self.browser_path,
+                headless=True,
+                persistent_profile_dir=profile,
+            )
+            try:
+                self.assertEqual(session.profile_dir, profile.resolve())
+                self.assertIn(f"--user-data-dir={profile.resolve()}", session.launch_args)
+            finally:
+                session.close()
+            self.assertTrue(profile.exists())
 
     def test_authenticated_http_proxy_is_used_by_incognito_context(self):
         authorized = []
@@ -305,22 +485,25 @@ class ChromiumBrowserTests(unittest.TestCase):
         server = ThreadingHTTPServer(("127.0.0.1", 0), Proxy)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        session = None
         try:
-            session = ChromiumSession(
-                self.browser_path,
-                headless=True,
-                raw_proxy=f"127.0.0.1:{server.server_port}:test:password",
-            )
-            with sync_playwright() as p:
-                browser = p.chromium.connect_over_cdp("http://" + session.remote_debugging_address)
-                page = open_workflow_page(browser, {"start_result": session})
-                page.goto("http://proxy-test.invalid/", timeout=15000)
-                self.assertEqual(page.title(), "proxied")
-                self.assertIn("http://proxy-test.invalid/", authorized)
+            for reuse_startup_context in (False, True):
+                authorized.clear()
+                session = ChromiumSession(
+                    self.browser_path,
+                    headless=True,
+                    raw_proxy=f"127.0.0.1:{server.server_port}:test:password",
+                    reuse_startup_context=reuse_startup_context,
+                )
+                try:
+                    with sync_playwright() as p:
+                        browser = p.chromium.connect_over_cdp("http://" + session.remote_debugging_address)
+                        page = open_workflow_page(browser, {"start_result": session})
+                        page.goto("http://proxy-test.invalid/", timeout=15000)
+                        self.assertEqual(page.title(), "proxied")
+                        self.assertIn("http://proxy-test.invalid/", authorized)
+                finally:
+                    session.close()
         finally:
-            if session is not None:
-                session.close()
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)

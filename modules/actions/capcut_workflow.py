@@ -120,7 +120,6 @@ def dismiss_capcut_onboarding(page, user: str = "", stop_event=None, timeout: fl
                 exact=True,
             ),
             page.locator("text=Skip"),
-            page.locator('[aria-label*="close" i], [role="button"][aria-label*="close" i]'),
         )
         clicked = False
         for control in controls:
@@ -692,6 +691,12 @@ def run_capcut_workflow(account: dict | None = None, context: dict | None = None
     force_resend_test = bool((context or {}).get("force_resend_test")) or os.getenv(
         "REGCAPCUT_FORCE_RESEND_TEST", ""
     ).strip().lower() in {"1", "true", "yes", "on"}
+    session = (context or {}).get("start_result")
+    using_proxy = bool(getattr(session, "proxy", None))
+    signup_step_timeout = 120000 if using_proxy else 30000
+    signup_click_timeout = 30000 if using_proxy else 10000
+    if using_proxy:
+        print("[CAPCUT][NETWORK] Proxy detected; allowing up to 120 seconds per signup step")
     cdp_url = _cdp_url(context)
     with sync_playwright() as playwright:
         browser = _connect_browser(playwright, cdp_url, user, stop_event)
@@ -745,20 +750,20 @@ def run_capcut_workflow(account: dict | None = None, context: dict | None = None
         accept_capcut_cookies(page, user, stop_event, timeout=0.1)
         page.get_by_role("button", name="Continue", exact=True).or_(
             page.get_by_role("button", name="Tiếp tục", exact=True)
-        ).click(timeout=10000)
+        ).click(timeout=signup_click_timeout)
 
         password_input = page.locator('input[name="password"]')
-        password_input.wait_for(state="visible", timeout=30000)
+        password_input.wait_for(state="visible", timeout=signup_step_timeout)
         password_input.fill(account["passnew"])
         accept_capcut_cookies(page, user, stop_event, timeout=0.1)
         page.get_by_role("button", name="Sign up", exact=True).or_(
             page.get_by_role("button", name="Đăng ký", exact=True)
-        ).click(timeout=10000)
+        ).click(timeout=signup_click_timeout)
 
         birthday_year = page.locator(
             'input[placeholder="Year"], input[placeholder="Năm"]'
         ).first
-        birthday_year.wait_for(state="visible", timeout=30000)
+        birthday_year.wait_for(state="visible", timeout=signup_step_timeout)
         print(f"[CAPCUT][SIGNUP] Birthday form ready: {user} | url={page.url}")
         _select_birthday(page, user)
         continue_button = page.get_by_role("button", name="Continue", exact=True).or_(
@@ -767,9 +772,9 @@ def run_capcut_workflow(account: dict | None = None, context: dict | None = None
         continue_button.wait_for(state="visible", timeout=5000)
         if not continue_button.is_enabled():
             raise RuntimeError(f"CapCut birthday form is incomplete for {user}")
-        continue_button.click(timeout=10000)
+        continue_button.click(timeout=signup_click_timeout)
 
-        _otp_inputs(page).first.wait_for(state="visible", timeout=30000)
+        _otp_inputs(page).first.wait_for(state="visible", timeout=signup_step_timeout)
         used_codes: set[str] = set()
         resent_code = None
         for attempt in range(3):

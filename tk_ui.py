@@ -1,4 +1,4 @@
-from modules.browser.chromium import ChromiumSession, resolve_chromium_154
+from modules.browser.chromium import CHROME_VERSION, ChromiumSession, resolve_chromium_154
 import queue
 import sys
 import threading
@@ -118,7 +118,7 @@ class Writer:
 class App:
     UNCHECKED = "\u2610"
     CHECKED = "\u2611"
-    STABLE_BROWSER_VERSION = "142.0.7444.163"
+    STABLE_BROWSER_VERSION = CHROME_VERSION
     WINDOWS_CHROME_UA = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/{browser_version} Safari/537.36"

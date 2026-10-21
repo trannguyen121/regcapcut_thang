@@ -4,7 +4,7 @@ import threading
 import types
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from modules.actions.capcut_add_link import (
     AlreadyJoinedSpaceError,
@@ -12,9 +12,11 @@ from modules.actions.capcut_add_link import (
     JoinVerificationError,
     _cant_join_space_visible,
     _cant_submit_request_visible,
+    _dismiss_post_submit_popups,
     _is_my_cloud_url,
     _login_with_email,
     _login_error_text,
+    _billing_cycle_from_text,
     _pro_plan_visible,
 )
 from modules.ui.reg_capcut_tab import (
@@ -26,7 +28,11 @@ from modules.ui.reg_capcut_tab import (
     parse_add_link_line,
     parse_capcut_login_line,
 )
-from modules.actions.capcut_workflow import accept_capcut_cookies, extract_capcut_username
+from modules.actions.capcut_workflow import (
+    accept_capcut_cookies,
+    dismiss_capcut_onboarding,
+    extract_capcut_username,
+)
 
 
 class _Body:
@@ -493,9 +499,30 @@ class CapCutAddLinkTests(unittest.TestCase):
 
     def test_common_login_errors_are_detected_immediately(self):
         self.assertEqual(_login_error_text("Email or password is incorrect"), "email or password is incorrect")
+        self.assertEqual(
+            _login_error_text("Enter a valid email or password"),
+            "enter a valid email or password",
+        )
         self.assertEqual(_login_error_text("Account not found"), "account not found")
         self.assertEqual(_login_error_text("Too many attempts. Try again later"), "too many attempts")
         self.assertIsNone(_login_error_text("Welcome to CapCut"))
+
+    def test_popup_cleanup_never_targets_generic_close_or_payment_controls(self):
+        page = Mock()
+        page.get_by_role.return_value = _EmptyLocator()
+        page.get_by_text.return_value = _EmptyLocator()
+        page.locator.return_value = _EmptyLocator()
+
+        with (
+            patch("modules.actions.capcut_add_link._wait"),
+            patch("modules.actions.capcut_workflow._wait"),
+        ):
+            _dismiss_post_submit_popups(page, "mail", None, timeout=0.3)
+            dismiss_capcut_onboarding(page, "mail", None, timeout=0.3)
+
+        selectors = [call.args[0] for call in page.locator.call_args_list]
+        self.assertTrue(selectors)
+        self.assertEqual(set(selectors), {"text=Skip"})
 
     def test_check_user_login_retries_a_transient_failure(self):
         class Page:
@@ -543,6 +570,28 @@ class CapCutAddLinkTests(unittest.TestCase):
         self.assertTrue(_pro_plan_visible(_Page("CapCut Pro: Active\nValid until 2027-01-01")))
         self.assertTrue(_pro_plan_visible(_Page("Subscription active")))
         self.assertFalse(_pro_plan_visible(_Page("Upgrade to Pro\nFree user")))
+
+    def test_free_pricing_copy_is_never_an_active_pro_signal(self):
+        self.assertFalse(_pro_plan_visible(_Page("Choose your plan\nFree\nCurrent plan\nPro\nUpgrade")))
+        self.assertFalse(_pro_plan_visible(_Page("Explore subscriptions\nPro plan\nUpgrade now")))
+        self.assertFalse(_pro_plan_visible(_Page("Current plan: Free\nUpgrade to Pro")))
+
+    def test_profile_renewal_card_is_an_active_pro_signal(self):
+        self.assertTrue(_pro_plan_visible(_Page("Pro\nRenews on 2027/10/10")))
+
+    def test_billing_cycle_requires_the_subscription_manager(self):
+        self.assertEqual(
+            _billing_cycle_from_text("Manage auto-renewal\nPro\nYearly\nNext billing date"),
+            "yearly",
+        )
+        self.assertEqual(
+            _billing_cycle_from_text("Manage subscription\nPro\nMonthly\nNext billing date"),
+            "monthly",
+        )
+        self.assertIsNone(
+            _billing_cycle_from_text("Manage subscription\nMonthly\nYearly")
+        )
+        self.assertIsNone(_billing_cycle_from_text("Pricing\nYearly\nMonthly"))
 
     def test_only_capcut_my_cloud_url_is_success(self):
         self.assertTrue(_is_my_cloud_url("https://www.capcut.com/my-cloud/123?tab=all"))
@@ -814,6 +863,42 @@ class CapCutAddLinkTests(unittest.TestCase):
         self.assertTrue(saved[0][1])
         self.assertIn("true", statuses)
 
+    def test_registration_hold_waits_after_success_until_chrome_is_closed(self):
+        app = RegCapCutApp.__new__(RegCapCutApp)
+        app.stop_event = threading.Event()
+        app.hold_mode = True
+        session = types.SimpleNamespace(terminate=lambda: None)
+        result = types.SimpleNamespace(success=True, incognito=True)
+        app._start_registration_browser = Mock(return_value=(session, result))
+        app._wait_for_hold_profile = Mock()
+        app.active_profiles = {}
+        app.active_profiles_lock = threading.Lock()
+        app.export_lock = threading.Lock()
+        app.mark_account_status = Mock()
+        app.queue_sheet_success = Mock()
+        account = {"user": "new@example.com", "passnew": "pass", "userID": ""}
+
+        def register(_target, context):
+            context["on_registered"]()
+            return True
+
+        with (
+            patch("modules.ui.reg_capcut_tab.run_capcut_workflow", side_effect=register),
+            patch("modules.ui.reg_capcut_tab.write_result"),
+        ):
+            app.run_worker(
+                account,
+                group_name="capcut",
+                index=0,
+                total=1,
+                semaphore=threading.Semaphore(1),
+                max_threads=1,
+            )
+
+        app._wait_for_hold_profile.assert_called_once_with(
+            result, "new@example.com"
+        )
+
     def test_result_files_use_link_pipe_count(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
@@ -1029,6 +1114,18 @@ class CapCutAddLinkTests(unittest.TestCase):
         # intentionally no separate check_pro_status_label widget.
         app.refresh_check_pro_status()
 
+    def test_yearly_and_monthly_buttons_start_the_matching_check_mode(self):
+        app = RegCapCutApp.__new__(RegCapCutApp)
+        app.start_check_pro = Mock()
+
+        RegCapCutApp.start_check_pro_yearly(app)
+        RegCapCutApp.start_check_pro_monthly(app)
+
+        self.assertEqual(
+            app.start_check_pro.call_args_list,
+            [call("yearly"), call("monthly")],
+        )
+
     def test_export_writes_only_checked_add_link_accounts(self):
         with tempfile.TemporaryDirectory() as directory:
             app = RegCapCutApp.__new__(RegCapCutApp)
@@ -1100,6 +1197,9 @@ class CapCutAddLinkTests(unittest.TestCase):
         )
         self.assertEqual(RegCapCutApp._add_link_account_status_text(""), "Chưa add link")
         self.assertEqual(RegCapCutApp._check_pro_status_text("true"), "Có CapCut Pro")
+        self.assertEqual(RegCapCutApp._check_pro_status_text("yearly"), "CapCut Pro năm")
+        self.assertEqual(RegCapCutApp._check_pro_status_text("monthly"), "CapCut Pro tháng")
+        self.assertEqual(RegCapCutApp._check_pro_status_text("teams_monthly"), "CapCut Teams tháng")
         self.assertEqual(RegCapCutApp._check_pro_status_text("false"), "Không có CapCut Pro")
         self.assertEqual(RegCapCutApp._check_pro_status_text(""), "Chưa kiểm tra")
 

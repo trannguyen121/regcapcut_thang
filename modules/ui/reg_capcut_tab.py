@@ -63,7 +63,12 @@ def link_member_limit(limits: dict | None, link: str) -> int:
     return max(TWO_SLOT_MEMBER_LIMIT, min(ADD_LINK_MEMBER_LIMIT, value))
 
 from core.settings import load_settings, save_settings
-from modules.browser.chromium import CHROME_MAJOR_VERSION, ChromiumSession, resolve_chromium_154
+from modules.browser.chromium import (
+    CHROME_MAJOR_VERSION,
+    ChromiumSession,
+    parse_browser_proxy,
+    resolve_chromium_154,
+)
 from modules.actions.capcut_workflow import (
     CAPCUT_SIGN_UP_URL,
     CapCutWorkflowInterrupted,
@@ -82,6 +87,7 @@ from modules.actions.capcut_add_link import (
     run_capcut_login_hold_workflow,
 )
 from modules.proxy.expressvpn import ExpressVPNController, ExpressVPNError
+from modules.proxy.thuecloud import parse_static_proxy_line
 from modules.storage.google_sheets import append_success_rows
 from modules.ui.capcut_space_check import CheckSpaceMixin
 
@@ -272,6 +278,17 @@ def status_text(accounts: list[dict], proxy_count: int | None = None) -> str:
     return text if proxy_count is None else f"{text} | Proxy: {proxy_count}"
 
 
+def registration_proxy_for_account(proxies: list, index: int, account_count: int):
+    """Assign contiguous, evenly-sized account groups to imported proxies."""
+    if not proxies:
+        return None
+    total = max(1, int(account_count))
+    position = min(max(0, int(index)), total - 1)
+    active_proxy_count = min(len(proxies), total)
+    proxy_index = min(active_proxy_count - 1, (position * active_proxy_count) // total)
+    return proxies[proxy_index]
+
+
 class RegCapCutWriter:
     HIDDEN_UI_PATTERNS = (
         "[CDP] Waiting",
@@ -365,6 +382,8 @@ class RegCapCutApp(CheckSpaceMixin):
         self.app_settings = load_settings()
         self.accounts_path = Path("account.txt")
         self.accounts = []
+        self.proxy_path = Path("proxy.txt")
+        self.proxies = []
         self.add_link_accounts_path = Path("account.txt")
         self.add_link_links_path = Path("link.txt")
         self.add_link_accounts = []
@@ -398,6 +417,8 @@ class RegCapCutApp(CheckSpaceMixin):
         self.check_pro_accounts_path = Path("account.txt")
         self.check_pro_accounts = []
         self.check_pro_path = Path("check gói") / "capcut_pro.txt"
+        self.check_pro_yearly_path = Path("check gói") / "capcut_pro_yearly.txt"
+        self.check_pro_monthly_path = Path("check gói") / "capcut_pro_monthly.txt"
         self.check_not_pro_path = Path("check gói") / "capcut_not_pro.txt"
         self.check_pro_error_path = Path("check gói") / "capcut_check_error.txt"
         self.check_pro_lock = threading.Lock()
@@ -504,6 +525,7 @@ class RegCapCutApp(CheckSpaceMixin):
         bar = tk.Frame(reg_tab, bg="#ffffff", relief="solid", borderwidth=1)
         bar.pack(fill="x", pady=(0, 8))
         self.tool_button(bar, "Import Mail", self.import_accounts, "#00a884", "#ffffff").pack(side="left", padx=8, pady=6)
+        self.tool_button(bar, "Import Proxy", self.import_proxies, "#0891b2", "#ffffff").pack(side="left", padx=4, pady=6)
         tk.Label(bar, text="Pass CapCut", bg="#ffffff").pack(side="left", padx=(12, 4), pady=6)
         self.passnew_entry = tk.Entry(bar, width=24, relief="solid", borderwidth=1, takefocus=0)
         self.passnew_entry.insert(0, "1234567")
@@ -520,6 +542,7 @@ class RegCapCutApp(CheckSpaceMixin):
         self.delay_entry.pack(side="left", pady=6)
         self.delay_entry.bind("<FocusOut>", self._entry_lost_focus)
         self.tool_button(bar, "Reg thường", self.start, "#059669", "#ffffff").pack(side="left", padx=4, pady=6)
+        self.tool_button(bar, "Reg CapCut treo", self.start_registration_hold, "#7c3aed", "#ffffff").pack(side="left", padx=4, pady=6)
         self.tool_button(bar, "Stop", self.stop, "#dc2626", "#ffffff").pack(side="left", padx=4, pady=6)
 
         tk.Label(
@@ -549,11 +572,11 @@ class RegCapCutApp(CheckSpaceMixin):
         ).pack(side="right", padx=(0, 6))
         reg_wrap = tk.Frame(reg_tab, bg="#ffffff", relief="solid", borderwidth=1)
         reg_wrap.pack(fill="both", expand=True, padx=4, pady=(0, 8))
-        self.reg_account_tree = ttk.Treeview(reg_wrap, columns=("checked", "user", "pass", "userID", "status"), show="headings", selectmode="extended", style="Checkbox.Treeview", height=9)
-        for col, title, width in (("checked", "Chọn", 55), ("user", "User", 260), ("pass", "Pass", 180), ("userID", "Username", 180), ("status", "Status", 180)):
+        self.reg_account_tree = ttk.Treeview(reg_wrap, columns=("checked", "user", "pass", "userID", "proxy", "status"), show="headings", selectmode="extended", style="Checkbox.Treeview", height=9)
+        for col, title, width in (("checked", "Chọn", 55), ("user", "User", 240), ("pass", "Pass", 150), ("userID", "Username", 160), ("proxy", "Proxy", 190), ("status", "Status", 160)):
             self.reg_account_tree.heading(col, text=title, command=lambda c=col: self._sort_tree_column(self.reg_account_tree, c))
             self.reg_account_tree.column(col, width=width, anchor="w")
-        for col, title, width in (("checked", "☑", 55), ("user", "User", 260), ("pass", "Pass", 180), ("userID", "UserID", 180), ("status", "Status", 180)):
+        for col, title, width in (("checked", "☑", 55), ("user", "User", 240), ("pass", "Pass", 150), ("userID", "UserID", 160), ("proxy", "Proxy", 190), ("status", "Status", 160)):
             self.reg_account_tree.heading(col, text=title)
             self.reg_account_tree.column(col, width=width, anchor="w")
         self.reg_account_tree.pack(fill="both", expand=True, padx=4, pady=4)
@@ -563,7 +586,7 @@ class RegCapCutApp(CheckSpaceMixin):
         self.reg_account_tree.bind("<ButtonPress-1>", self._reg_account_press)
         self.reg_account_tree.bind("<B1-Motion>", self._reg_account_drag)
 
-        self.status_label = tk.Label(reg_tab, text=status_text(self.accounts), bg="#f3f4f7", fg="#111827", font=("Tahoma", 10, "bold"))
+        self.status_label = tk.Label(reg_tab, text=status_text(self.accounts, len(self.proxies)), bg="#f3f4f7", fg="#111827", font=("Tahoma", 10, "bold"))
         self.status_label.pack(anchor="w", padx=4, pady=(4, 8))
 
         self.build_add_link_tab(add_link_tab)
@@ -594,7 +617,14 @@ class RegCapCutApp(CheckSpaceMixin):
         self.tool_button(bar, "Dừng", self.stop, "#dc2626", "#ffffff").pack(side="left", padx=4, pady=6)
         check_buttons = tk.Frame(bar, bg="#ffffff")
         check_buttons.pack(side="right", padx=(4, 8), pady=6)
-        self.tool_button(check_buttons, "Kiểm tra CapCut Pro", self.start_check_pro, "#7c3aed", "#ffffff").pack(fill="x")
+        plan_buttons = tk.Frame(check_buttons, bg="#ffffff")
+        plan_buttons.pack(fill="x")
+        self.tool_button(
+            plan_buttons, "Kiểm tra gói năm", self.start_check_pro_yearly, "#7c3aed", "#ffffff"
+        ).pack(side="left")
+        self.tool_button(
+            plan_buttons, "Kiểm tra gói tháng", self.start_check_pro_monthly, "#9333ea", "#ffffff"
+        ).pack(side="left", padx=(4, 0))
         space_buttons = tk.Frame(check_buttons, bg="#ffffff")
         space_buttons.pack(fill="x", pady=(4, 0))
         self.tool_button(space_buttons, "Check Space", self.start_check_space, "#0369a1", "#ffffff").pack(side="left")
@@ -759,7 +789,17 @@ class RegCapCutApp(CheckSpaceMixin):
     @staticmethod
     def _check_pro_status_text(status):
         status = str(status or "").strip()
-        if status == "true":
+        if status == "yearly":
+            return "CapCut Pro năm"
+        if status == "monthly":
+            return "CapCut Pro tháng"
+        if status == "teams":
+            return "CapCut Pro Teams"
+        if status == "teams_yearly":
+            return "CapCut Teams năm"
+        if status == "teams_monthly":
+            return "CapCut Teams tháng"
+        if status in {"true", "pro", "ultra"}:
             return "Có CapCut Pro"
         if status == "false":
             return "Không có CapCut Pro"
@@ -1450,6 +1490,46 @@ class RegCapCutApp(CheckSpaceMixin):
         if skipped:
             print(f"Skipped {skipped} invalid mail API lines. Expected: email|passmail|refresh_token|client_id")
 
+    def import_proxies(self):
+        path = filedialog.askopenfilename(
+            title="Open proxy file",
+            initialdir=str(Path.cwd()),
+            initialfile="proxy.txt",
+            filetypes=[("Text Files", "*.txt"), ("All Files", "*.*")],
+        )
+        if not path:
+            return
+        self.proxy_path = Path(path)
+        self.load_proxies()
+
+    def load_proxies(self):
+        if not self.proxy_path.exists():
+            messagebox.showinfo("Info", f"File not found: {self.proxy_path}")
+            return
+        loaded = []
+        seen = set()
+        skipped = 0
+        for line in self.proxy_path.read_text(encoding="utf-8-sig").splitlines():
+            if not line.strip():
+                continue
+            try:
+                proxy = parse_static_proxy_line(line)
+                # Validate before a registration thread has already started.
+                parse_browser_proxy(proxy.raw_proxy)
+            except (ValueError, RuntimeError):
+                skipped += 1
+                continue
+            key = (proxy.raw_proxy, proxy.change_ip_url)
+            if key in seen:
+                continue
+            seen.add(key)
+            loaded.append(proxy)
+        self.proxies = loaded
+        self.refresh_status()
+        print(f"Loaded {len(self.proxies)} Reg CapCut proxies from {self.proxy_path.name}")
+        if skipped:
+            print(f"Skipped {skipped} invalid proxy lines")
+
     def import_add_link_accounts(self):
         path = filedialog.askopenfilename(
             title="Chọn file tài khoản CapCut",
@@ -1629,7 +1709,13 @@ class RegCapCutApp(CheckSpaceMixin):
 
     def refresh_check_pro_status(self):
         accounts = self.add_link_accounts
-        pro_count = sum(1 for account in accounts if account.get("pro_status") == "true")
+        paid_statuses = {
+            "true", "pro", "ultra", "teams", "monthly", "yearly",
+            "teams_monthly", "teams_yearly",
+        }
+        pro_count = sum(1 for account in accounts if account.get("pro_status") in paid_statuses)
+        yearly_count = sum(1 for account in accounts if account.get("pro_status") in {"yearly", "teams_yearly"})
+        monthly_count = sum(1 for account in accounts if account.get("pro_status") in {"monthly", "teams_monthly"})
         failed_count = sum(
             1
             for account in accounts
@@ -1642,7 +1728,8 @@ class RegCapCutApp(CheckSpaceMixin):
             self.check_pro_status_label.configure(
                 text=(
                     f"Tài khoản dùng chung: {len(accounts)} | Đã chọn để kiểm tra: {selected_count} | "
-                    f"Có Pro: {pro_count} | Không Pro/Lỗi: {failed_count}"
+                    f"Có Pro: {pro_count} (năm {yearly_count}, tháng {monthly_count}) | "
+                    f"Không Pro/Lỗi: {failed_count}"
                 )
             )
 
@@ -1676,12 +1763,19 @@ class RegCapCutApp(CheckSpaceMixin):
             for link in self.add_link_links
         )
         # CapCut Pro counts
-        pro_count = sum(1 for account in self.add_link_accounts if account.get("pro_status") == "true")
+        paid_statuses = {
+            "true", "pro", "ultra", "teams", "monthly", "yearly",
+            "teams_monthly", "teams_yearly",
+        }
+        pro_count = sum(1 for account in self.add_link_accounts if account.get("pro_status") in paid_statuses)
+        yearly_count = sum(1 for account in self.add_link_accounts if account.get("pro_status") in {"yearly", "teams_yearly"})
+        monthly_count = sum(1 for account in self.add_link_accounts if account.get("pro_status") in {"monthly", "teams_monthly"})
         not_pro_count = sum(1 for account in self.add_link_accounts if account.get("pro_status") in {"false", "error"})
         self.add_link_status_label.configure(
             text=(
                 f"Tài khoản: {len(self.add_link_accounts)} (đã chọn: {selected_accounts}) | "
-                f"CapCut Pro: Có {pro_count} / Không {not_pro_count}\n"
+                f"CapCut Pro: Có {pro_count} (năm {yearly_count}, tháng {monthly_count}) / "
+                f"Không {not_pro_count}\n"
                 f"Link: {len(self.add_link_links)} | Link đã chọn: {selected_count} | "
                 f"Đã thêm: {joined} | Link còn lại: {remaining_links} | Lượt còn lại: {remaining_slots}"
             )
@@ -1691,7 +1785,7 @@ class RegCapCutApp(CheckSpaceMixin):
             self.refresh_check_pro_status()
 
     def refresh_status(self):
-        self.status_label.configure(text=status_text(self.accounts))
+        self.status_label.configure(text=status_text(self.accounts, len(getattr(self, "proxies", []))))
         self.render_reg_accounts()
 
     def render_reg_accounts(self):
@@ -1700,7 +1794,12 @@ class RegCapCutApp(CheckSpaceMixin):
             return
         tree.delete(*tree.get_children())
         for i, acc in enumerate(self.accounts):
-            tree.insert("", "end", iid=str(i), values=(self.CHECKBOX_SELECTED if acc.get("picked") else self.CHECKBOX_UNSELECTED, acc.get("user", ""), acc.get("passnew", ""), acc.get("userID", ""), acc.get("status", "")))
+            raw_proxy = str(acc.get("registration_proxy", "") or "").strip()
+            try:
+                proxy_server = parse_browser_proxy(raw_proxy)["server"] if raw_proxy else ""
+            except RuntimeError:
+                proxy_server = "Proxy invalid"
+            tree.insert("", "end", iid=str(i), values=(self.CHECKBOX_SELECTED if acc.get("picked") else self.CHECKBOX_UNSELECTED, acc.get("user", ""), acc.get("passnew", ""), acc.get("userID", ""), proxy_server, acc.get("status", "")))
 
     def _sort_tree_column(self, tree, column):
         state = getattr(tree, "_sort_reverse", {})
@@ -1905,7 +2004,15 @@ class RegCapCutApp(CheckSpaceMixin):
         finally:
             self._close_standalone_process(session)
 
-    def start_check_pro(self):
+    def start_check_pro_yearly(self):
+        self.start_check_pro("yearly")
+
+    def start_check_pro_monthly(self):
+        self.start_check_pro("monthly")
+
+    def start_check_pro(self, requested_cycle=None):
+        if requested_cycle not in {None, "yearly", "monthly"}:
+            raise ValueError(f"Unsupported CapCut billing cycle: {requested_cycle}")
         if not self.add_link_accounts:
             messagebox.showinfo("Thông báo", "Hãy nhập tài khoản vào Bảng acc thêm link trước")
             return
@@ -1935,9 +2042,16 @@ class RegCapCutApp(CheckSpaceMixin):
             account["pro_status"] = ""
         self._save_add_link_account_state()
         self.check_pro_path.parent.mkdir(exist_ok=True)
-        for path in (self.check_pro_path, self.check_not_pro_path, self.check_pro_error_path):
+        for path in (
+            self.check_pro_path,
+            self.check_pro_yearly_path,
+            self.check_pro_monthly_path,
+            self.check_not_pro_path,
+            self.check_pro_error_path,
+        ):
             path.write_text("", encoding="utf-8")
         self.stop_event.clear()
+        self.check_pro_requested_cycle = requested_cycle
         self.current_accounts = list(self.check_pro_accounts)
         self.refresh_add_link_status()
         self.task_thread = threading.Thread(
@@ -1948,6 +2062,12 @@ class RegCapCutApp(CheckSpaceMixin):
         self.task_thread.start()
 
     def run_check_pro_accounts(self, max_threads, launch_delay):
+        requested_cycle = getattr(self, "check_pro_requested_cycle", None)
+        mode_label = {
+            "yearly": "gói năm",
+            "monthly": "gói tháng",
+        }.get(requested_cycle, "CapCut Pro")
+        print(f"[CAPCUT][CHECK PRO] Starting {mode_label}: {len(self.check_pro_accounts)} accounts")
         group_name = self.selected_group_name()
         semaphore = threading.Semaphore(max_threads)
         workers = []
@@ -1987,7 +2107,12 @@ class RegCapCutApp(CheckSpaceMixin):
         print(
             "[CAPCUT][CHECK PRO] Workflow stopped"
             if self.stop_event.is_set()
-            else f"[CAPCUT][CHECK PRO] Completed. Pro: {self.check_pro_path} | Not Pro: {self.check_not_pro_path}"
+            else (
+                f"[CAPCUT][CHECK PRO] Completed {mode_label}. "
+                f"Yearly: {self.check_pro_yearly_path} | "
+                f"Monthly: {self.check_pro_monthly_path} | "
+                f"Not Pro: {self.check_not_pro_path}"
+            )
         )
         self.current_accounts = []
         self.task_thread = None
@@ -2015,7 +2140,7 @@ class RegCapCutApp(CheckSpaceMixin):
                 }
                 for attempt in range(2):
                     try:
-                        is_pro = run_capcut_check_pro_workflow(account, workflow_context)
+                        plan_result = run_capcut_check_pro_workflow(account, workflow_context)
                         break
                     except CapCutWorkflowInterrupted:
                         raise
@@ -2027,9 +2152,30 @@ class RegCapCutApp(CheckSpaceMixin):
                             f'{account["user"]}: {exc}'
                         )
                         time.sleep(2.0)
-                account["pro_status"] = "true" if is_pro else "false"
-                self.append_check_pro_result(account, self.check_pro_path if is_pro else self.check_not_pro_path)
-                print(f'[CAPCUT][CHECK PRO] {"PRO" if is_pro else "NOT PRO"}: {account["user"]}')
+                if plan_result is True:
+                    plan_status = "pro"
+                elif plan_result is False or plan_result is None:
+                    plan_status = "false"
+                else:
+                    plan_status = str(plan_result).strip().casefold()
+                paid_statuses = {
+                    "pro", "ultra", "teams", "monthly", "yearly",
+                    "teams_monthly", "teams_yearly",
+                }
+                if plan_status not in paid_statuses | {"false"}:
+                    raise RuntimeError(f"Unknown CapCut plan result: {plan_result}")
+                is_pro = plan_status in paid_statuses
+                account["pro_status"] = plan_status
+                self.append_check_pro_result(
+                    account,
+                    self.check_pro_path if is_pro else self.check_not_pro_path,
+                )
+                if plan_status in {"yearly", "teams_yearly"}:
+                    self.append_check_pro_result(account, self.check_pro_yearly_path)
+                elif plan_status in {"monthly", "teams_monthly"}:
+                    self.append_check_pro_result(account, self.check_pro_monthly_path)
+                label = plan_status.upper() if is_pro else "NOT PRO"
+                print(f'[CAPCUT][CHECK PRO] {label}: {account["user"]}')
             except CapCutWorkflowInterrupted as exc:
                 account["pro_status"] = "stopped"
                 print(f'[CAPCUT][CHECK PRO] Stopped: {account["user"]} - {exc}')
@@ -2453,6 +2599,12 @@ class RegCapCutApp(CheckSpaceMixin):
                 file.flush()
 
     def start(self):
+        self._start_registration(hold_open=False)
+
+    def start_registration_hold(self):
+        self._start_registration(hold_open=True)
+
+    def _start_registration(self, hold_open=False):
         selected = [account for account in self.accounts if account["picked"]]
         if not selected:
             messagebox.showinfo("Info", "Import mail first")
@@ -2480,10 +2632,19 @@ class RegCapCutApp(CheckSpaceMixin):
             messagebox.showerror("Chrome 154", str(exc))
             print(f"[REG CAPCUT] Chrome 154 preflight failed: {exc}")
             return
+        self.hold_mode = bool(hold_open)
         self.stop_event.clear()
         self.current_accounts = selected
-        for account in selected:
+        for index, account in enumerate(selected):
             account["passnew"] = passnew
+            proxy = registration_proxy_for_account(getattr(self, "proxies", []), index, len(selected))
+            account["registration_proxy"] = proxy.raw_proxy if proxy is not None else ""
+        if getattr(self, "proxies", []):
+            used_proxy_count = min(len(self.proxies), len(selected))
+            print(
+                f"[REG CAPCUT] Assigned {len(selected)} accounts evenly to "
+                f"{used_proxy_count} proxies"
+            )
         self.refresh_status()
         self.task_thread = threading.Thread(target=self.run_accounts, args=(selected, max_threads, launch_delay), daemon=True)
         self.task_thread.start()
@@ -2608,6 +2769,7 @@ class RegCapCutApp(CheckSpaceMixin):
         print("Reg CapCut workflow stopped" if self.stop_event.is_set() else "Reg CapCut workflow completed")
         self.current_accounts = []
         self.task_thread = None
+        self.hold_mode = False
 
     def run_worker(self, account, group_name, index, total, semaphore, max_threads):
         with semaphore:
@@ -2676,9 +2838,7 @@ class RegCapCutApp(CheckSpaceMixin):
     def _start_standalone_chromium(self, account, index, browser_override=None,
                                    profile_root=None, startup_url=CAPCUT_SIGN_UP_URL,
                                    max_threads=1, expected_major=CHROME_MAJOR_VERSION,
-                                   reuse_startup_context=False):
-        # profile_root is accepted for compatibility; every session gets a fresh
-        # temporary directory, never a reused account/index directory.
+                                   reuse_startup_context=False, raw_proxy=""):
         session = ChromiumSession(
             browser_override or self._resolve_chromium_154_browser(),
             stop_event=self.stop_event,
@@ -2686,6 +2846,9 @@ class RegCapCutApp(CheckSpaceMixin):
             index=index % max_threads, total_windows=max_threads,
             expected_major=expected_major,
             reuse_startup_context=reuse_startup_context,
+            raw_proxy=raw_proxy,
+            startup_url=startup_url,
+            persistent_profile_dir=profile_root,
         )
         with self.active_profiles_lock:
             self.active_standalone_processes[str(session.profile_dir)] = session
@@ -2720,11 +2883,26 @@ class RegCapCutApp(CheckSpaceMixin):
         )
 
     def _start_registration_browser(self, account, index, max_threads):
-        """Start a disposable incognito session with the configured Chrome 154."""
+        """Start Chrome 154; Reg treo retains v7.5 profile preferences."""
+        raw_proxy = str(account.get("registration_proxy", "") or "").strip()
+        if raw_proxy:
+            proxy_server = parse_browser_proxy(raw_proxy)["server"]
+            print(f'[REG CAPCUT] Proxy for {account["user"]}: {proxy_server}')
+        hold_open = bool(getattr(self, "hold_mode", False))
+        profile_root = None
+        if hold_open:
+            # Preserve the v7.5 Reg treo behavior: each account position gets a
+            # stable Chromium profile while the actual web session stays incognito.
+            profile_root = Path("reg treo") / "chromium_profiles" / str(index + 1)
         return self._start_standalone_chromium(
             account,
             index,
             max_threads=max_threads,
+            # Reg CapCut treo must keep and expose Chrome's original --incognito
+            # window so manual checkout/popups remain in that private session.
+            reuse_startup_context=hold_open,
+            raw_proxy=raw_proxy,
+            profile_root=profile_root,
         )
 
     def _close_standalone_process(self, process):
@@ -2844,10 +3022,19 @@ class RegCapCutApp(CheckSpaceMixin):
         print("Stop requested")
 
     def drain(self):
-        while not self.output_queue.empty():
-            self.log.insert("end", self.output_queue.get_nowait())
+        # Do bounded work per Tk event-loop turn. With several browser workers,
+        # draining until the queue is empty can starve painting and make the
+        # window look frozen while new log lines keep arriving.
+        chunks = []
+        for _ in range(200):
+            try:
+                chunks.append(self.output_queue.get_nowait())
+            except queue.Empty:
+                break
+        if chunks:
+            self.log.insert("end", "".join(chunks))
             self.log.see("end")
-        self.root.after(100, self.drain)
+        self.root.after(10 if not self.output_queue.empty() else 100, self.drain)
 
 
 def main() -> None:

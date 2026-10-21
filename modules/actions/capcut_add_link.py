@@ -242,6 +242,7 @@ LOGIN_ERROR_MARKERS = (
     "invalid password",
     "email or password is incorrect",
     "email address or password is incorrect",
+    "enter a valid email or password",
     "wrong password",
     "account doesn't exist",
     "account does not exist",
@@ -293,7 +294,12 @@ def _cant_submit_request_visible(page) -> bool:
 
 
 def _pro_plan_visible(page) -> bool:
-    """Confirm an active individual or Teams Pro membership indicator."""
+    """Confirm Pro only from an explicit active-membership indicator.
+
+    Pricing pages contain generic text such as ``Pro plan``, ``Current plan``
+    and ``Upgrade to Pro`` even for Free accounts.  Those strings must never
+    be treated as proof of an active subscription.
+    """
     text = _body_text(page).casefold()
     active_statuses = (
         "pro: active",
@@ -305,11 +311,171 @@ def _pro_plan_visible(page) -> bool:
         or "you're enjoying pro benefits" in text
         or "you’re enjoying pro benefits" in text
         or ("pro benefits" in text and ("teams member" in text or "pro member" in text))
-        # Additional Pro indicators
-        or "pro plan" in text
-        or "upgrade to pro" in text and ("active" in text or "current" in text)
-        or "current plan" in text and ("pro" in text or "premium" in text)
+        # The authenticated profile card renders the active product directly
+        # above its renewal/expiry date (for example: Pro / Renews on ...).
+        or bool(
+            re.search(
+                r"(?im)^\s*(?:pro|ultra|teams)\s*$\s*"
+                r"^(?:renews?|expires?|valid\s+until|next\s+billing\s+date)\b",
+                text,
+            )
+        )
     )
+
+
+def _billing_cycle_from_text(text: str) -> str | None:
+    """Return the billing cycle shown in CapCut's read-only plan manager."""
+    normalized = str(text or "").casefold()
+    if not any(marker in normalized for marker in ("manage auto-renewal", "manage subscription")):
+        return None
+    yearly = bool(re.search(r"(?im)^\s*(?:yearly|annual|one year|hàng năm|theo năm)\s*$", normalized))
+    monthly = bool(re.search(r"(?im)^\s*(?:monthly|one month|hàng tháng|theo tháng)\s*$", normalized))
+    # A pricing dialog can contain both choices. Text alone cannot identify
+    # which tab is selected, so leave that decision to the DOM-aware reader.
+    if yearly and not monthly:
+        return "yearly"
+    if monthly and not yearly:
+        return "monthly"
+    return None
+
+
+def _profile_plan_kind(page) -> str | None:
+    """Read an active product from the authenticated profile card."""
+    text = _body_text(page)
+    lowered = text.casefold()
+    if "pro benefits" in lowered and "teams member" in lowered:
+        return "teams"
+    match = re.search(
+        r"(?im)^\s*(pro|ultra|teams)\s*$\s*"
+        r"^(?:renews?|expires?|valid\s+until|next\s+billing\s+date)\b",
+        text,
+    )
+    if match:
+        return match.group(1).casefold()
+    if any(marker in lowered for marker in ("pro: active", "capcut pro: active", "subscription active")):
+        return "pro"
+    return None
+
+
+def _read_profile_billing_cycle(page, user: str, stop_event) -> str | None:
+    """Open the active plan card and read Yearly/Monthly without changing it."""
+    teams_member_profile = bool(
+        re.search(r"pro benefits.{0,80}teams member", _body_text(page), re.I | re.S)
+    )
+    plan_titles = page.get_by_text(re.compile(r"^\s*(?:Pro|Ultra|Teams)\s*$", re.I), exact=True)
+    print(f"[CAPCUT][CHECK PRO] Visible plan-title candidates: {plan_titles.count()} | {user}")
+    for index in range(min(plan_titles.count(), 20)):
+        title = plan_titles.nth(index)
+        try:
+            if not title.is_visible():
+                continue
+            title_text = title.inner_text(timeout=1000).strip()
+            print(
+                f"[CAPCUT][CHECK PRO] Opening visible plan title "
+                f"{title_text!r} at index {index}: {user}"
+            )
+            card = title.locator("xpath=ancestor::div[1]")
+            clickable = title
+            card_matched = False
+            try:
+                for _ in range(8):
+                    card_text = card.inner_text(timeout=400)
+                    if teams_member_profile:
+                        if re.search(r"pro benefits.{0,200}teams member", card_text, re.I | re.S):
+                            clickable = card
+                            card_matched = True
+                            break
+                    else:
+                        if (
+                            len(card_text) <= 500
+                            and re.search(r"(?im)^\s*(?:pro|ultra|teams)\s*$", card_text)
+                            and re.search(r"(?im)^\s*(?:renews?|expires?|valid\s+until)\b", card_text)
+                        ):
+                            clickable = card
+                            card_matched = True
+                            break
+                    card = card.locator("xpath=..")
+            except Exception:
+                clickable = title
+            if teams_member_profile and not card_matched:
+                print(
+                    f"[CAPCUT][CHECK PRO] Skipping unrelated visible plan title "
+                    f"at index {index}: {user}"
+                )
+                continue
+            try:
+                clickable.click(timeout=1500)
+            except Exception:
+                try:
+                    clickable.click(timeout=1500, force=True)
+                except Exception:
+                    title.evaluate("element => element.click()")
+            print(f"[CAPCUT][CHECK PRO] Plan-title click dispatched: {user}")
+            deadline = time.time() + 6.0
+            retry_stage = 0
+            details_logged = False
+            while time.time() <= deadline:
+                _ensure_running(stop_event, user)
+                try:
+                    body_text = str(page.evaluate("() => document.body ? document.body.innerText : ''") or "")
+                except Exception:
+                    body_text = ""
+                details_visible = any(
+                    marker in body_text.casefold()
+                    for marker in ("manage auto-renewal", "manage subscription")
+                )
+                if details_visible and not details_logged:
+                    print(f"[CAPCUT][CHECK PRO] Plan details became visible: {user}")
+                    details_logged = True
+                # CapCut occasionally swallows the first click while the menu
+                # animation is finishing. Retry the title, then the outer VIP
+                # card; both are pointer targets in current CapCut rollouts.
+                if not details_visible and retry_stage == 0 and time.time() >= deadline - 4.0:
+                    title.evaluate("element => element.click()")
+                    retry_stage = 1
+                    _wait(0.35, stop_event, user)
+                    continue
+                if not details_visible and retry_stage == 1 and time.time() >= deadline - 2.0:
+                    try:
+                        clickable.locator("xpath=..").evaluate("element => element.click()")
+                    except Exception:
+                        pass
+                    retry_stage = 2
+                    _wait(0.35, stop_event, user)
+                    continue
+                try:
+                    active_text = str(
+                        page.evaluate(
+                            """() => {
+                                const tab = document.querySelector(
+                                    'button.subscriptionModal-tabActive, '
+                                    + 'button[aria-selected="true"], [role="tab"][aria-selected="true"]'
+                                );
+                                return tab ? (tab.innerText || tab.textContent || '') : '';
+                            }"""
+                        )
+                        or ""
+                    ).casefold()
+                except Exception:
+                    active_text = ""
+                if re.search(r"\bmonthly\b|\bone month\b|hàng tháng|theo tháng", active_text):
+                    print(f"[CAPCUT][CHECK PRO] Billing cycle confirmed: monthly | {user}")
+                    return "monthly"
+                if re.search(r"\byearly\b|\bannual\b|\bone year\b|hàng năm|theo năm", active_text):
+                    print(f"[CAPCUT][CHECK PRO] Billing cycle confirmed: yearly | {user}")
+                    return "yearly"
+                cycle = _billing_cycle_from_text(body_text)
+                if cycle:
+                    print(f"[CAPCUT][CHECK PRO] Billing cycle confirmed: {cycle} | {user}")
+                    return cycle
+                _wait(0.25, stop_event, user)
+            print(f"[CAPCUT][CHECK PRO] Billing cycle unavailable after opening plan details: {user}")
+            return None
+        except CapCutWorkflowInterrupted:
+            raise
+        except Exception:
+            continue
+    return None
 
 
 def _check_pro_via_subscription_page(page, user: str, stop_event) -> bool | None:
@@ -366,10 +532,13 @@ def _click_visible_control(locator, timeout: int = 1500) -> bool:
 
 def _dismiss_post_submit_popups(page, user: str, stop_event, timeout: float = 15.0) -> None:
     """Dismiss CapCut onboarding/announcement layers that cover the profile avatar."""
-    deadline = time.time() + timeout
-    max_cycles = int(timeout / 0.3)  # Prevent infinite loops
+    started = time.monotonic()
+    deadline = started + max(0.0, timeout)
+    quiet_since = started
     cycles = 0
-    while time.time() <= deadline and cycles < max_cycles:
+    max_cycles = max(1, int(max(0.0, timeout) / 0.1) + 5)
+    while time.monotonic() <= deadline and cycles < max_cycles:
+        cycles += 1
         _ensure_running(stop_event, user)
         clicked = False
         controls = (
@@ -382,25 +551,20 @@ def _dismiss_post_submit_popups(page, user: str, stop_event, timeout: float = 15
                 exact=True,
             ),
             page.locator("text=Skip"),
-            page.get_by_role("button", name=re.compile(r"^(close|dismiss|đóng|tắt)$", re.I)),
-            page.locator('[aria-label*="close" i], [role="button"][aria-label*="close" i]'),
-            page.locator('button:has-text("×"), button:has-text("✕")'),
-            # Additional CapCut-specific dismiss buttons
-            page.locator('button:has-text("OK")'),
-            page.locator('button:has-text("Confirm")'),
-            page.locator('button:has-text("Continue")'),
         )
         for control in controls:
             if _click_visible_control(control):
                 clicked = True
                 print(f"[CAPCUT][POPUP] Dismissed a popup for {user}")
-                _wait(0.7, stop_event, user)
+                quiet_since = time.monotonic()
+                _wait(0.35, stop_event, user)
                 break
         if not clicked:
-            # Some onboarding layers appear several seconds after the home page.
-            # Keep polling for the promised timeout instead of returning early.
-            _wait(0.25, stop_event, user)
-        cycles += 1
+            # Once the page stays quiet, continue immediately. If another layer
+            # appears later, the profile retry path invokes this cleanup again.
+            if time.monotonic() - quiet_since >= min(0.7, max(0.0, timeout)):
+                return
+            _wait(0.15, stop_event, user)
 
 
 def _open_profile_menu(page, user: str, stop_event, max_attempts: int = 5) -> bool:
@@ -589,16 +753,32 @@ def _login_with_email_once(page, account: dict, stop_event) -> None:
             f"CapCut login blocked after email for {user}: password form did not appear"
         )
 
+    if "/signup" in page.url.casefold():
+        raise CapCutLoginError(
+            f"CapCut redirected to signup after email for {user}; "
+            "the account was not recognized as an existing login"
+        )
+
     password_input.fill(password)
     print(f"[CAPCUT][ADD LINK][LOGIN] Password form ready; submitting login: {user}")
     accept_capcut_cookies(page, user, stop_event, timeout=0.1)
-    _click_first_visible(
-        (
-            page.get_by_role("button", name=re.compile(r"^(log in|sign in)$", re.IGNORECASE)),
-            page.locator('button[type="submit"]'),
-        ),
-        timeout=10000,
-    )
+    try:
+        _click_first_visible(
+            (
+                page.get_by_role(
+                    "button",
+                    name=re.compile(r"^(log in|sign in|continue)$", re.IGNORECASE),
+                ),
+                page.locator('button[type="submit"]'),
+            ),
+            timeout=4000,
+        )
+    except RuntimeError:
+        # CapCut currently A/B tests a password form whose submit control has no
+        # stable accessible name/type. On a real login URL, submitting the
+        # focused password field is equivalent to pressing the visible button.
+        password_input.press("Enter")
+        print(f"[CAPCUT][LOGIN] Submitted password with Enter fallback: {user}")
 
     deadline = time.time() + 45.0
     last_text = ""
@@ -609,7 +789,10 @@ def _login_with_email_once(page, account: dict, stop_event) -> None:
             login_error = _login_error_text(last_text)
             if login_error:
                 raise CapCutLoginError(f"CapCut login failed for {user}: {login_error}")
-            if not password_input.is_visible() and "/login" not in page.url.lower():
+            current_url = page.url.lower()
+            if not password_input.is_visible() and not any(
+                marker in current_url for marker in ("/login", "/signup")
+            ):
                 print(f"[CAPCUT][LOGIN] Logged in: {user}")
                 return
         except CapCutWorkflowInterrupted:
@@ -631,12 +814,14 @@ def _login_with_email(page, account: dict, stop_event, max_attempts: int = 3) ->
         "incorrect password",
         "invalid password",
         "email or password is incorrect",
+        "enter a valid email or password",
         "wrong password",
         "account doesn't exist",
         "account does not exist",
         "account not found",
         "user doesn't exist",
         "user does not exist",
+        "redirected to signup",
     )
     for attempt in range(1, attempts + 1):
         _ensure_running(stop_event, user)
@@ -845,8 +1030,8 @@ def run_capcut_login_hold_workflow(account: dict, context: dict | None = None) -
         return True
 
 
-def run_capcut_check_pro_workflow(account: dict, context: dict | None = None) -> bool:
-    """Log in, dismiss CapCut popups, and check the Pro card in the profile menu."""
+def run_capcut_check_pro_workflow(account: dict, context: dict | None = None) -> str | bool:
+    """Return yearly/monthly/teams/pro for paid accounts, otherwise False."""
     if not account.get("user") or not account.get("passnew"):
         raise RuntimeError("Missing CapCut email or password")
 
@@ -856,50 +1041,80 @@ def run_capcut_check_pro_workflow(account: dict, context: dict | None = None) ->
     with sync_playwright() as playwright:
         browser = _connect_browser(playwright, cdp_url, user, stop_event)
         page = open_workflow_page(browser, context)
-        _login_with_email(page, account, stop_event)
-        try:
-            account["userID"] = extract_capcut_username(
-                page, user, stop_event, dismiss_popups=_dismiss_post_submit_popups
+        # A check batch already retries the whole account once at worker level.
+        # Repeating the login three more times in the same browser only extends
+        # IP throttling and can hold one slot for over a minute.
+        _login_with_email(page, account, stop_event, max_attempts=1)
+        print(f"[CAPCUT][CHECK PRO] Authenticated landing page: {page.url} | {user}")
+        # Plan checking does not need the public username. Extracting it can
+        # navigate through onboarding pages and adds 10-20 seconds per account.
+        account.setdefault("userID", "")
+
+        # Fresh accounts can remain on the role survey after login. In that
+        # state every avatar click fails and the old nested retry loop looked
+        # like a frozen form. Move to My Cloud once and clear that onboarding
+        # before looking for the authenticated profile card.
+        initial_text = _body_text(page).casefold()
+        onboarding_prepared = False
+        if "/my-edit" in str(page.url).casefold() or any(
+            marker in initial_text
+            for marker in (
+                "which of the following roles best describes you",
+                "get started with space",
+                "templates & projects",
             )
-        except Exception:
-            account.setdefault("userID", "")
+        ):
+            for navigation_attempt in range(2):
+                _ensure_running(stop_event, user)
+                try:
+                    page.goto(CAPCUT_MY_CLOUD_URL, wait_until="domcontentloaded", timeout=20000)
+                    _wait(1.5, stop_event, user)
+                    _dismiss_post_submit_popups(page, user, stop_event, timeout=3.0)
+                    if "/my-cloud" in str(page.url).casefold():
+                        onboarding_prepared = True
+                        break
+                except CapCutWorkflowInterrupted:
+                    raise
+                except Exception:
+                    if navigation_attempt >= 1:
+                        break
 
         # Let the authenticated home page and its onboarding layers settle. Close
         # each Skip/Got it/X layer, then open the profile menu only once so a
         # non-Pro account cannot toggle the menu open and closed repeatedly.
-        _wait(4.0, stop_event, user)
-        _dismiss_post_submit_popups(page, user, stop_event, timeout=15.0)
+        if not onboarding_prepared:
+            _wait(1.0, stop_event, user)
+            _dismiss_post_submit_popups(page, user, stop_event, timeout=1.5)
 
-        # Try to open profile menu with multiple strategies (up to 5 attempts)
-        menu_opened = False
-        for attempt in range(3):
-            _ensure_running(stop_event, user)
-            if _open_profile_menu(page, user, stop_event, max_attempts=5):
-                menu_opened = True
-                # Increased timeout from 5s to 12s for Pro check
-                deadline = time.time() + 12.0
-                menu_visible_seen = False
-                while time.time() <= deadline:
-                    _ensure_running(stop_event, user)
-                    if _pro_plan_visible(page):
-                        print(f"[CAPCUT][CHECK PRO] Pro confirmed in profile menu: {user}")
-                        return True
-                    if _profile_menu_visible(page):
-                        # Keep waiting for delayed subscription text instead of
-                        # declaring Not Pro after a single 300 ms render cycle.
-                        menu_visible_seen = True
-                    _wait(0.3, stop_event, user)
-                # Only treat the account as Not Pro after the full confirmation
-                # window elapsed while an authenticated profile menu was visible.
-                if menu_visible_seen or _profile_menu_visible(page):
-                    print(f"[CAPCUT][CHECK PRO] Pro check timeout; assuming not Pro: {user}")
-                    return False
-            if attempt < 2:
-                _dismiss_post_submit_popups(page, user, stop_event, timeout=5.0)
-                _wait(1.0, stop_event, user)
+        # _open_profile_menu already performs bounded strategies. Do not
+        # wrap it in another three-attempt loop, which could stall one account
+        # for minutes when CapCut blocks the avatar behind onboarding.
+        menu_opened = _open_profile_menu(page, user, stop_event, max_attempts=3)
+        if menu_opened:
+            deadline = time.time() + 12.0
+            menu_visible_seen = False
+            while time.time() <= deadline:
+                _ensure_running(stop_event, user)
+                plan_kind = _profile_plan_kind(page)
+                if plan_kind:
+                    print(
+                        f"[CAPCUT][CHECK PRO] Active {plan_kind.title()} confirmed "
+                        f"in profile menu: {user}"
+                    )
+                    billing_cycle = _read_profile_billing_cycle(page, user, stop_event)
+                    if plan_kind == "teams" and billing_cycle:
+                        return f"teams_{billing_cycle}"
+                    return billing_cycle or plan_kind
+                if _profile_menu_visible(page):
+                    menu_visible_seen = True
+                _wait(0.3, stop_event, user)
+            if menu_visible_seen or _profile_menu_visible(page):
+                print(f"[CAPCUT][CHECK PRO] Pro check timeout; assuming not Pro: {user}")
+                return False
 
         # Backup method: try subscription/settings pages if profile menu failed
         if not menu_opened:
+            print(f"[CAPCUT][CHECK PRO] Profile unavailable at {page.url} | {user}")
             print(f"[CAPCUT][CHECK PRO] Profile menu failed, trying subscription pages for {user}")
             result = _check_pro_via_subscription_page(page, user, stop_event)
             if result is not None:

@@ -84,14 +84,20 @@ def parse_browser_proxy(raw):
 class ChromiumSession:
     def __init__(self, browser, *, stop_event=None, raw_proxy="", window_settings=None,
                  index=0, total_windows=1, headless=False, expected_major=CHROME_MAJOR_VERSION,
-                 reuse_startup_context=False):
+                 reuse_startup_context=False, startup_url="about:blank",
+                 persistent_profile_dir=None):
         self.proxy = parse_browser_proxy(raw_proxy)
         self.incognito = True
         self.reuse_startup_context = bool(reuse_startup_context)
         self.success = False
         self._lock = threading.RLock()
-        self._temp = tempfile.TemporaryDirectory(prefix="capcut-chrome-154-")
-        self.profile_dir = Path(self._temp.name).resolve()
+        self._temp = None
+        if persistent_profile_dir:
+            self.profile_dir = Path(persistent_profile_dir).resolve()
+            self.profile_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            self._temp = tempfile.TemporaryDirectory(prefix="capcut-chrome-154-")
+            self.profile_dir = Path(self._temp.name).resolve()
         self.process = None
         self._closed = False
         # Keep Chrome's normal defaults. Only isolation, incognito and the CDP
@@ -102,6 +108,11 @@ class ChromiumSession:
             "--remote-debugging-port=0",
             f"--user-data-dir={self.profile_dir}",
             "--incognito",
+            "--no-first-run",
+            "--no-default-browser-check",
+            # CapCut opens its external cashier in a user-triggered popup.
+            # Keep Chrome's incognito isolation while allowing that checkout window.
+            "--disable-popup-blocking",
         ]
         if headless:
             args.append("--headless=new")
@@ -110,7 +121,8 @@ class ChromiumSession:
         if window_settings is not None:
             layout = resolve_browser_window_layout(window_settings, window_index=index, total_windows=total_windows)
             args.extend([f"--window-position={layout.position}", f"--window-size={layout.size}"])
-        args.append("about:blank")
+        args.append(str(startup_url or "about:blank"))
+        self.launch_args = tuple(args)
         try:
             self.process = subprocess.Popen(args, cwd=str(Path(browser).parent),
                                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -163,18 +175,19 @@ class ChromiumSession:
                 except subprocess.TimeoutExpired:
                     self.process.kill()
                     self.process.wait(timeout=5)
-            # Only remove the unique directory allocated by TemporaryDirectory.
-            if Path(self._temp.name).resolve() != self.profile_dir or self.profile_dir.parent != Path(tempfile.gettempdir()).resolve():
-                raise RuntimeError("Unexpected Chrome temporary directory")
-            # Windows may hold cache handles briefly after the process tree exits.
-            for attempt in range(30):
-                try:
-                    self._temp.cleanup()
-                    break
-                except PermissionError:
-                    if attempt == 29:
-                        raise
-                    time.sleep(0.1)
+            if self._temp is not None:
+                # Only remove the unique directory allocated by TemporaryDirectory.
+                if Path(self._temp.name).resolve() != self.profile_dir or self.profile_dir.parent != Path(tempfile.gettempdir()).resolve():
+                    raise RuntimeError("Unexpected Chrome temporary directory")
+                # Windows may hold cache handles briefly after the process tree exits.
+                for attempt in range(30):
+                    try:
+                        self._temp.cleanup()
+                        break
+                    except PermissionError:
+                        if attempt == 29:
+                            raise
+                        time.sleep(0.1)
             self._closed = True
 
     terminate = close
@@ -190,7 +203,36 @@ def open_workflow_page(browser, context):
         )
         if browser_context is None:
             raise RuntimeError("Không tìm thấy context ẩn danh khởi động của Chrome")
-        return browser_context.pages[0] if browser_context.pages else browser_context.new_page()
+        page = browser_context.pages[0] if browser_context.pages else browser_context.new_page()
+        proxy = getattr(session, "proxy", None) or {}
+        if proxy.get("username") is not None:
+            # A context connected over CDP cannot receive Playwright's `proxy`
+            # option. Handle HTTP proxy authentication through DevTools so hold
+            # mode can keep Chrome's original visible --incognito window.
+            cdp = browser_context.new_cdp_session(page)
+
+            def continue_request(event):
+                cdp.send("Fetch.continueRequest", {"requestId": event["requestId"]})
+
+            def authenticate(event):
+                response = {"response": "Default"}
+                if event.get("authChallenge", {}).get("source") == "Proxy":
+                    response = {
+                        "response": "ProvideCredentials",
+                        "username": proxy["username"],
+                        "password": proxy.get("password", ""),
+                    }
+                cdp.send(
+                    "Fetch.continueWithAuth",
+                    {"requestId": event["requestId"], "authChallengeResponse": response},
+                )
+
+            cdp.on("Fetch.requestPaused", continue_request)
+            cdp.on("Fetch.authRequired", authenticate)
+            cdp.send("Fetch.enable", {"handleAuthRequests": True})
+            # Keep the CDP session alive for as long as the page is alive.
+            page._capcut_proxy_auth_session = cdp
+        return page
     if getattr(session, "incognito", False):
         options = {"no_viewport": True}
         if session.proxy:
