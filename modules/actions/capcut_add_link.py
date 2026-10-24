@@ -379,7 +379,18 @@ def _read_profile_billing_cycle(page, user: str, stop_event) -> str | None:
             card_matched = False
             try:
                 for _ in range(8):
-                    card_text = card.inner_text(timeout=400)
+                    card_info = card.evaluate(
+                        """element => ({
+                            text: element.innerText || '',
+                            className: String(element.className || '')
+                        })""",
+                        timeout=400,
+                    )
+                    card_text = str(card_info.get("text", ""))
+                    card_class = str(card_info.get("className", ""))
+                    is_plan_card = bool(
+                        re.search(r"(?:vip|subscription|plan)[-_ ]?card", card_class, re.I)
+                    )
                     if teams_member_profile:
                         if re.search(r"pro benefits.{0,200}teams member", card_text, re.I | re.S):
                             clickable = card
@@ -394,6 +405,10 @@ def _read_profile_billing_cycle(page, user: str, stop_event) -> str | None:
                             clickable = card
                             card_matched = True
                             break
+                    if is_plan_card and len(card_text) <= 800:
+                        clickable = card
+                        card_matched = True
+                        break
                     card = card.locator("xpath=..")
             except Exception:
                 clickable = title
@@ -409,7 +424,7 @@ def _read_profile_billing_cycle(page, user: str, stop_event) -> str | None:
                 try:
                     clickable.click(timeout=1500, force=True)
                 except Exception:
-                    title.evaluate("element => element.click()")
+                    title.evaluate("element => element.click()", timeout=500)
             print(f"[CAPCUT][CHECK PRO] Plan-title click dispatched: {user}")
             deadline = time.time() + 6.0
             retry_stage = 0
@@ -424,6 +439,10 @@ def _read_profile_billing_cycle(page, user: str, stop_event) -> str | None:
                     marker in body_text.casefold()
                     for marker in ("manage auto-renewal", "manage subscription")
                 )
+                if not details_visible and _dismiss_promotion_popup(page):
+                    print(f"[CAPCUT][POPUP] Dismissed promotion while opening plan details: {user}")
+                    _wait(0.25, stop_event, user)
+                    continue
                 if details_visible and not details_logged:
                     print(f"[CAPCUT][CHECK PRO] Plan details became visible: {user}")
                     details_logged = True
@@ -431,13 +450,18 @@ def _read_profile_billing_cycle(page, user: str, stop_event) -> str | None:
                 # animation is finishing. Retry the title, then the outer VIP
                 # card; both are pointer targets in current CapCut rollouts.
                 if not details_visible and retry_stage == 0 and time.time() >= deadline - 4.0:
-                    title.evaluate("element => element.click()")
+                    try:
+                        clickable.evaluate("element => element.click()", timeout=500)
+                    except Exception:
+                        pass
                     retry_stage = 1
                     _wait(0.35, stop_event, user)
                     continue
                 if not details_visible and retry_stage == 1 and time.time() >= deadline - 2.0:
                     try:
-                        clickable.locator("xpath=..").evaluate("element => element.click()")
+                        clickable.locator("xpath=..").evaluate(
+                            "element => element.click()", timeout=500
+                        )
                     except Exception:
                         pass
                     retry_stage = 2
@@ -473,7 +497,11 @@ def _read_profile_billing_cycle(page, user: str, stop_event) -> str | None:
             return None
         except CapCutWorkflowInterrupted:
             raise
-        except Exception:
+        except Exception as exc:
+            print(
+                f"[CAPCUT][CHECK PRO] Plan detail candidate failed for {user}: "
+                f"{type(exc).__name__}: {str(exc).splitlines()[0][:200]}"
+            )
             continue
     return None
 
@@ -530,6 +558,100 @@ def _click_visible_control(locator, timeout: int = 1500) -> bool:
     return False
 
 
+def _dismiss_promotion_popup(page) -> bool:
+    """Close a visible CapCut promotion by its top-right icon.
+
+    Some promotion dialogs expose only an unlabelled SVG ``X``. Keep this
+    fallback scoped to a small dialog containing known promotion copy so it
+    cannot click a checkout window, the profile avatar, or an offer button.
+    """
+    try:
+        return bool(
+            page.evaluate(
+                r"""() => {
+                    const visible = (element) => {
+                        const style = getComputedStyle(element);
+                        const box = element.getBoundingClientRect();
+                        return style.display !== 'none' && style.visibility !== 'hidden' &&
+                            Number(style.opacity || 1) > 0 && box.width > 0 && box.height > 0;
+                    };
+                    const promoCopy = /(capcut\s+pro|get\s+pro\s+at\s+\d+%\s+off|learn\s+more|get\s+offer)/i;
+                    const actionCopy = /^(learn\s+more|get\s+offer|upgrade|subscribe|buy|pay)$/i;
+                    const rootCandidates = Array.from(document.querySelectorAll(
+                        '[role="dialog"], [aria-modal="true"], [class*="modal" i], '
+                        + '[class*="dialog" i], [class*="popup" i]'
+                    ));
+                    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+                    let textNode;
+                    while ((textNode = walker.nextNode())) {
+                        if (!promoCopy.test(textNode.nodeValue || '')) continue;
+                        let ancestor = textNode.parentElement;
+                        for (let depth = 0; ancestor && depth < 8; depth += 1) {
+                            rootCandidates.push(ancestor);
+                            ancestor = ancestor.parentElement;
+                        }
+                    }
+                    const roots = Array.from(new Set(rootCandidates)).filter((root) => {
+                        if (!visible(root) || !promoCopy.test(root.innerText || '')) return false;
+                        const box = root.getBoundingClientRect();
+                        return box.width >= 240 && box.width <= 900 && box.height >= 180 &&
+                            box.height <= 760 && box.width * box.height < innerWidth * innerHeight * 0.8;
+                    }).sort((left, right) => {
+                        const a = left.getBoundingClientRect();
+                        const b = right.getBoundingClientRect();
+                        return a.width * a.height - b.width * b.height;
+                    });
+                    for (const root of roots) {
+                        const rootBox = root.getBoundingClientRect();
+                        const candidates = Array.from(root.querySelectorAll(
+                            'button, [role="button"], [aria-label], [data-testid], '
+                            + '[class*="close" i], svg'
+                        )).sort((left, right) => {
+                            const a = left.getBoundingClientRect();
+                            const b = right.getBoundingClientRect();
+                            const aDistance = Math.hypot(rootBox.right - (a.left + a.width / 2),
+                                (a.top + a.height / 2) - rootBox.top);
+                            const bDistance = Math.hypot(rootBox.right - (b.left + b.width / 2),
+                                (b.top + b.height / 2) - rootBox.top);
+                            return aDistance - bDistance;
+                        });
+                        for (const candidate of candidates) {
+                            if (!visible(candidate)) continue;
+                            const label = (
+                                candidate.getAttribute('aria-label') ||
+                                candidate.getAttribute('title') ||
+                                candidate.innerText || ''
+                            ).trim();
+                            if (actionCopy.test(label)) continue;
+                            const box = candidate.getBoundingClientRect();
+                            const centerX = box.left + box.width / 2;
+                            const centerY = box.top + box.height / 2;
+                            const inTopRight = centerX >= rootBox.left + rootBox.width * 0.78 &&
+                                centerY <= rootBox.top + Math.min(120, rootBox.height * 0.35);
+                            const closeSized = box.width >= 8 && box.height >= 8 &&
+                                box.width <= 80 && box.height <= 80;
+                            const className = String(candidate.className?.baseVal || candidate.className || '');
+                            const namedClose = /^(close|dismiss|x)$/i.test(label) || /close/i.test(className);
+                            if (!closeSized || (!inTopRight && !namedClose)) continue;
+                            const target = candidate.closest('button, [role="button"]') || candidate;
+                            if (typeof target.click === 'function') {
+                                target.click();
+                            } else {
+                                target.dispatchEvent(new MouseEvent('click', {
+                                    bubbles: true, cancelable: true, view: window
+                                }));
+                            }
+                            return true;
+                        }
+                    }
+                    return false;
+                }"""
+            )
+        )
+    except Exception:
+        return False
+
+
 def _dismiss_post_submit_popups(page, user: str, stop_event, timeout: float = 15.0) -> None:
     """Dismiss CapCut onboarding/announcement layers that cover the profile avatar."""
     started = time.monotonic()
@@ -559,6 +681,11 @@ def _dismiss_post_submit_popups(page, user: str, stop_event, timeout: float = 15
                 quiet_since = time.monotonic()
                 _wait(0.35, stop_event, user)
                 break
+        if not clicked and _dismiss_promotion_popup(page):
+            clicked = True
+            print(f"[CAPCUT][POPUP] Dismissed promotion popup for {user}")
+            quiet_since = time.monotonic()
+            _wait(0.35, stop_event, user)
         if not clicked:
             # Once the page stays quiet, continue immediately. If another layer
             # appears later, the profile retry path invokes this cleanup again.

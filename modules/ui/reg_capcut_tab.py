@@ -39,6 +39,48 @@ APP_TITLE = f"Reg CapCut v{APP_VERSION}"
 # A 5-slot CapCut package has one owner and up to four invited accounts.
 ADD_LINK_MEMBER_LIMIT = 4
 TWO_SLOT_MEMBER_LIMIT = 1
+CHECK_PRO_MAX_THREADS = 3
+
+
+def bounded_check_pro_threads(value) -> int:
+    """Keep plan checks below CapCut's unstable high-concurrency range."""
+    return min(CHECK_PRO_MAX_THREADS, max(1, int(value)))
+
+
+def is_transient_check_login_error(exc: Exception) -> bool:
+    """Separate network/page failures from bad or unknown CapCut accounts."""
+    message = str(exc).casefold()
+    definitive_markers = (
+        "redirected to signup",
+        "not recognized as an existing login",
+        "account does not exist",
+        "account doesn't exist",
+        "account not found",
+        "user does not exist",
+        "user doesn't exist",
+        "incorrect password",
+        "invalid password",
+        "wrong password",
+        "email or password is incorrect",
+        "enter a valid email or password",
+    )
+    if any(marker in message for marker in definitive_markers):
+        return False
+    transient_markers = (
+        "timeout",
+        "timed out",
+        "net::",
+        "navigation",
+        "connection",
+        "cdp",
+        "temporar",
+        "try again later",
+        "too many attempts",
+        "password form did not appear",
+    )
+    return isinstance(exc, CapCutLoginError) or any(
+        marker in message for marker in transient_markers
+    )
 
 
 def normalize_add_link(value: str) -> str:
@@ -2028,10 +2070,16 @@ class RegCapCutApp(CheckSpaceMixin):
             messagebox.showinfo("Thông báo", "Một tác vụ CapCut đang chạy")
             return
         try:
-            max_threads = max(1, int(self.add_link_threads_entry.get().strip() or "1"))
+            requested_threads = max(1, int(self.add_link_threads_entry.get().strip() or "1"))
         except ValueError:
             messagebox.showinfo("Thông báo", "Số luồng phải là một số")
             return
+        max_threads = bounded_check_pro_threads(requested_threads)
+        if max_threads != requested_threads:
+            print(
+                f"[CAPCUT][CHECK PRO] Limited concurrency from "
+                f"{requested_threads} to {max_threads} for login stability"
+            )
         try:
             launch_delay = max(0.0, float(self.add_link_delay_entry.get().strip() or "0"))
         except ValueError:
@@ -2062,6 +2110,7 @@ class RegCapCutApp(CheckSpaceMixin):
         self.task_thread.start()
 
     def run_check_pro_accounts(self, max_threads, launch_delay):
+        max_threads = bounded_check_pro_threads(max_threads)
         requested_cycle = getattr(self, "check_pro_requested_cycle", None)
         mode_label = {
             "yearly": "gói năm",
@@ -2131,27 +2180,38 @@ class RegCapCutApp(CheckSpaceMixin):
                     self.root.after(0, self.refresh_add_link_status)
                 except RuntimeError:
                     pass
-                standalone_process, result = self._start_account_browser(
-                    account, index, max_threads, startup_url=CAPCUT_LOGIN_URL,
-                )
-                workflow_context = {
-                    "start_result": result,
-                    "stop_event": self.stop_event,
-                }
                 for attempt in range(2):
+                    standalone_process, result = self._start_account_browser(
+                        account, index, max_threads, startup_url=CAPCUT_LOGIN_URL,
+                    )
+                    workflow_context = {
+                        "start_result": result,
+                        "stop_event": self.stop_event,
+                    }
                     try:
                         plan_result = run_capcut_check_pro_workflow(account, workflow_context)
                         break
                     except CapCutWorkflowInterrupted:
                         raise
                     except Exception as exc:
+                        if isinstance(exc, CapCutLoginError) and not is_transient_check_login_error(exc):
+                            # Bad credentials and unknown accounts cannot be
+                            # repaired by reopening the same login flow.
+                            raise
                         if attempt >= 1:
                             raise
                         print(
                             f'[CAPCUT][CHECK PRO] Retry 1/1 after transient error for '
                             f'{account["user"]}: {exc}'
                         )
-                        time.sleep(2.0)
+                        # A Playwright/CDP failure can terminate the standalone
+                        # browser. Always retry with a new Chrome session.
+                        self._close_standalone_process(standalone_process)
+                        standalone_process = None
+                        if self.stop_event.wait(2.0):
+                            raise CapCutWorkflowInterrupted(
+                                f'Stop requested for {account["user"]}'
+                            )
                 if plan_result is True:
                     plan_status = "pro"
                 elif plan_result is False or plan_result is None:
@@ -2180,8 +2240,7 @@ class RegCapCutApp(CheckSpaceMixin):
                 account["pro_status"] = "stopped"
                 print(f'[CAPCUT][CHECK PRO] Stopped: {account["user"]} - {exc}')
             except Exception as exc:
-                error_text = str(exc).lower()
-                if any(marker in error_text for marker in ("login", "password", "email step", "sign up")):
+                if is_transient_check_login_error(exc):
                     self._request_expressvpn_reset()
                 account["pro_status"] = "error"
                 self.append_check_pro_result(account, self.check_pro_error_path)
@@ -2921,12 +2980,16 @@ class RegCapCutApp(CheckSpaceMixin):
         lock = getattr(self, "_expressvpn_login_fail_lock", None)
         if event is not None and lock is not None:
             with lock:
+                if event.is_set():
+                    return
                 self._expressvpn_login_fail_count += 1
                 failures = self._expressvpn_login_fail_count
+                should_reset = failures >= 4
+                if should_reset:
+                    event.set()
             print(f"[REG CAPCUT] Login failure {failures}/4")
-            if failures < 4:
+            if not should_reset:
                 return
-            event.set()
             print("[REG CAPCUT] Four login failures detected; ExpressVPN reset queued")
 
     def reset_expressvpn_ip(self, reason=""):

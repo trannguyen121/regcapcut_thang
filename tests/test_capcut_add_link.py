@@ -12,6 +12,7 @@ from modules.actions.capcut_add_link import (
     JoinVerificationError,
     _cant_join_space_visible,
     _cant_submit_request_visible,
+    _dismiss_promotion_popup,
     _dismiss_post_submit_popups,
     _is_my_cloud_url,
     _login_with_email,
@@ -29,6 +30,9 @@ from modules.ui.reg_capcut_tab import (
     parse_capcut_login_line,
 )
 from modules.actions.capcut_workflow import (
+    _select_birthday,
+    _select_visible_option,
+    _visible_locator,
     accept_capcut_cookies,
     dismiss_capcut_onboarding,
     extract_capcut_username,
@@ -66,6 +70,39 @@ class _Page:
 
 
 class CapCutAddLinkTests(unittest.TestCase):
+    def test_birthday_helpers_ignore_hidden_duplicate_and_match_visible_option(self):
+        hidden = Mock()
+        hidden.is_visible.return_value = False
+        visible = Mock()
+        visible.is_visible.return_value = True
+        visible.inner_text.return_value = "March"
+        locator = Mock()
+        locator.count.return_value = 2
+        locator.nth.side_effect = [hidden, visible, hidden, visible]
+
+        self.assertIs(_visible_locator(locator, "month"), visible)
+
+        empty_fallback = Mock()
+        empty_fallback.count.return_value = 0
+        page = Mock()
+        page.get_by_role.return_value = locator
+        page.locator.return_value = empty_fallback
+        _select_visible_option(page, "March", 2)
+        visible.click.assert_called_once_with(timeout=7000)
+
+    def test_birthday_retry_accepts_form_when_continue_is_already_enabled(self):
+        page = Mock()
+        with (
+            patch("modules.actions.capcut_workflow.accept_capcut_cookies"),
+            patch(
+                "modules.actions.capcut_workflow._birthday_continue_ready",
+                return_value=True,
+            ),
+        ):
+            _select_birthday(page, "completed@example.com")
+
+        page.locator.assert_not_called()
+
     def _make_add_link_app(self, directory, accounts):
         app = RegCapCutApp.__new__(RegCapCutApp)
         base = Path(directory)
@@ -512,6 +549,7 @@ class CapCutAddLinkTests(unittest.TestCase):
         page.get_by_role.return_value = _EmptyLocator()
         page.get_by_text.return_value = _EmptyLocator()
         page.locator.return_value = _EmptyLocator()
+        page.evaluate.return_value = False
 
         with (
             patch("modules.actions.capcut_add_link._wait"),
@@ -523,6 +561,18 @@ class CapCutAddLinkTests(unittest.TestCase):
         selectors = [call.args[0] for call in page.locator.call_args_list]
         self.assertTrue(selectors)
         self.assertEqual(set(selectors), {"text=Skip"})
+
+    def test_promotion_popup_fallback_is_scoped_and_excludes_offer_actions(self):
+        page = Mock()
+        page.evaluate.return_value = True
+
+        self.assertTrue(_dismiss_promotion_popup(page))
+
+        script = page.evaluate.call_args.args[0]
+        self.assertIn("promoCopy", script)
+        self.assertIn("actionCopy", script)
+        self.assertIn("inTopRight", script)
+        self.assertIn("get\\s+offer", script)
 
     def test_check_user_login_retries_a_transient_failure(self):
         class Page:

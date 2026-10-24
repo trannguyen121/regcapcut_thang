@@ -281,9 +281,9 @@ def _wait_for_resent_capcut_code(
         except Exception as exc:
             last_error = exc
             print(f"[CAPCUT][OTP] Resend mailbox warning for {user}: {exc}")
-        if time.time() + 2.0 > deadline:
+        if time.time() + 1.0 > deadline:
             break
-        _wait(2.0, stop_event, user)
+        _wait(1.0, stop_event, user)
     if last_error is not None:
         raise RuntimeError(f"CapCut resent OTP polling failed for {user}: {last_error}") from last_error
     raise RuntimeError(f"CapCut resent verification email was not found for {user}")
@@ -311,9 +311,9 @@ def _wait_for_capcut_code(
         except Exception as exc:
             last_error = exc
             print(f"[CAPCUT][OTP] Mailbox warning for {user}: {exc}")
-        if time.time() + 2.0 > deadline:
+        if time.time() + 1.0 > deadline:
             break
-        _wait(2.0, stop_event, user)
+        _wait(1.0, stop_event, user)
     if last_error is not None:
         raise RuntimeError(f"CapCut OTP polling failed for {user}: {last_error}") from last_error
     raise RuntimeError(f"CapCut verification code was not found for {user}")
@@ -364,9 +364,11 @@ def _get_capcut_code_with_resend(
     account: dict,
     stop_event,
     excluded: set[str],
-    initial_timeout: float = 60.0,
+    initial_timeout: float = 25.0,
+    max_resends: int = 3,
+    resent_timeout: float = 45.0,
 ) -> str:
-    """Read the first code, or resend once after a full initial wait."""
+    """Read the first code, then retry Resend as soon as CapCut allows it."""
     user = account["user"]
     try:
         return _wait_for_capcut_code(
@@ -382,14 +384,34 @@ def _get_capcut_code_with_resend(
             f"[CAPCUT][OTP] No verification code after {initial_timeout:.0f}s for {user}: "
             f"{first_error}"
         )
-    previous_fingerprints = _capcut_message_fingerprints(_get_messages(account))
-    _resend_capcut_code(page, user, stop_event)
-    return _wait_for_resent_capcut_code(
-        account,
-        stop_event,
-        previous_fingerprints,
-        timeout=120.0,
-    )
+    last_error = None
+    for resend_attempt in range(1, max_resends + 1):
+        _ensure_running(stop_event, user)
+        try:
+            previous_fingerprints = _capcut_message_fingerprints(_get_messages(account))
+            print(
+                f"[CAPCUT][OTP] Resend attempt {resend_attempt}/{max_resends} "
+                f"for {user}"
+            )
+            _resend_capcut_code(page, user, stop_event)
+            return _wait_for_resent_capcut_code(
+                account,
+                stop_event,
+                previous_fingerprints,
+                timeout=resent_timeout,
+            )
+        except CapCutWorkflowInterrupted:
+            raise
+        except RuntimeError as exc:
+            last_error = exc
+            print(
+                f"[CAPCUT][OTP] Resend attempt {resend_attempt}/{max_resends} "
+                f"did not return a code for {user}: {exc}"
+            )
+    raise RuntimeError(
+        f"CapCut OTP was not received after {max_resends} resend attempts for {user}: "
+        f"{last_error}"
+    ) from last_error
 
 
 def _force_resend_test(
@@ -432,26 +454,142 @@ def _birthday_for(email: str) -> tuple[str, str, str]:
     return str(year), MONTH_NAMES[month_index], str(day)
 
 
+def _visible_locator(locator, description: str):
+    """Return the first visible match instead of trusting a hidden DOM duplicate."""
+    count = min(locator.count(), 50)
+    for index in range(count):
+        candidate = locator.nth(index)
+        try:
+            if candidate.is_visible():
+                return candidate
+        except Exception:
+            continue
+    raise RuntimeError(f"CapCut {description} is not visible")
+
+
+def _select_visible_option(page, label: str, fallback_index: int) -> None:
+    """Choose an option from the currently open birthday dropdown."""
+    option_sets = (
+        page.get_by_role("option"),
+        page.locator(
+            '[role="option"], [class*="option" i], '
+            '[class*="select-item" i], [class*="menu-item" i]'
+        ),
+    )
+    normalized_label = label.strip().casefold()
+    for options in option_sets:
+        visible = []
+        try:
+            count = min(options.count(), 100)
+        except Exception:
+            continue
+        for index in range(count):
+            candidate = options.nth(index)
+            try:
+                if not candidate.is_visible():
+                    continue
+                text = candidate.inner_text(timeout=1000).strip()
+            except Exception:
+                continue
+            visible.append(candidate)
+            if text.casefold() == normalized_label:
+                candidate.click(timeout=7000)
+                return
+        if 0 <= fallback_index < len(visible):
+            visible[fallback_index].click(timeout=7000)
+            return
+    raise RuntimeError(f'CapCut birthday option "{label}" is not visible')
+
+
+def _birthday_continue_ready(page, timeout: float = 0.0) -> bool:
+    """Use the enabled Continue button as CapCut's source of truth for the form."""
+    deadline = time.time() + max(0.0, timeout)
+    while True:
+        buttons = page.get_by_role("button", name="Continue", exact=True).or_(
+            page.get_by_role("button", name="Tiếp tục", exact=True)
+        )
+        try:
+            count = min(buttons.count(), 10)
+        except Exception:
+            count = 0
+        for index in range(count):
+            candidate = buttons.nth(index)
+            try:
+                if candidate.is_visible() and candidate.is_enabled():
+                    return True
+            except Exception:
+                continue
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.15)
+
+
 def _select_birthday(page, email: str) -> None:
     year, month, day = _birthday_for(email)
     month_index = MONTH_NAMES.index(month)
-    year_input = page.locator('input[placeholder="Year"], input[placeholder="Năm"]').first
-    month_input = page.locator('input[placeholder="Month"], input[placeholder="Tháng"]').first
-    day_input = page.locator('input[placeholder="Day"], input[placeholder="Ngày"]').first
     for attempt in range(1, 4):
         try:
             accept_capcut_cookies(page, email, None, timeout=1.0)
+            # CapCut removes the Month/Day placeholder attributes after a
+            # value is selected. A retry must recognize a completed form
+            # before trying to locate those placeholders again.
+            if _birthday_continue_ready(page, timeout=0.25):
+                print(f"[CAPCUT][SIGNUP] Birthday form already complete for {email}")
+                return
+            year_input = _visible_locator(
+                page.locator('input[placeholder="Year"], input[placeholder="Năm"]'),
+                "birthday year input",
+            )
             year_input.fill(year)
-            month_input.locator("..").click(timeout=7000)
-            page.get_by_role("option").nth(month_index).click(timeout=7000)
-            day_input.locator("..").click(timeout=7000)
-            page.get_by_role("option", name=day, exact=True).last.click(timeout=7000)
+            year_input.press("Tab")
+            try:
+                month_input = _visible_locator(
+                    page.locator('input[placeholder="Month"], input[placeholder="Tháng"]'),
+                    "birthday month input",
+                )
+            except RuntimeError:
+                # A missing month placeholder can mean that the previous
+                # attempt selected it successfully before the DOM re-rendered.
+                _visible_locator(
+                    page.locator('input[placeholder="Day"], input[placeholder="Ngày"]'),
+                    "birthday day input",
+                )
+                month_input = None
+            if month_input is not None:
+                try:
+                    month_input.locator("..").click(timeout=7000)
+                except Exception:
+                    month_input.click(timeout=7000)
+                _select_visible_option(page, month, month_index)
+
+            if _birthday_continue_ready(page, timeout=0.25):
+                print(f"[CAPCUT][SIGNUP] Birthday selected for {email}: {year}-{month}-{day}")
+                return
+
+            # Selecting a month can re-render all three controls. Resolve the
+            # day input again instead of using a detached locator.
+            day_input = _visible_locator(
+                page.locator('input[placeholder="Day"], input[placeholder="Ngày"]'),
+                "birthday day input",
+            )
+            try:
+                day_input.locator("..").click(timeout=7000)
+            except Exception:
+                day_input.click(timeout=7000)
+            _select_visible_option(page, day, int(day) - 1)
+            if not _birthday_continue_ready(page, timeout=3.0):
+                raise RuntimeError("CapCut birthday Continue button is still disabled")
+            print(f"[CAPCUT][SIGNUP] Birthday selected for {email}: {year}-{month}-{day}")
             return
-        except Exception:
+        except Exception as exc:
             if attempt >= 3:
                 raise
+            print(
+                f"[CAPCUT][SIGNUP] Birthday retry {attempt}/3 for {email}: "
+                f"{type(exc).__name__}: {str(exc).splitlines()[0][:240]}"
+            )
             accept_capcut_cookies(page, email, None, timeout=1.0)
-            time.sleep(3.0)
+            time.sleep(1.5)
 
 
 def _otp_inputs(page):
@@ -679,8 +817,204 @@ def extract_capcut_username(page, user: str = "", stop_event=None, dismiss_popup
     return ""
 
 
+def _first_visible_control(candidates):
+    """Return the first visible Playwright locator from a locator collection."""
+    try:
+        count = min(candidates.count(), 20)
+    except Exception:
+        return None
+    for index in range(count):
+        candidate = candidates.nth(index)
+        try:
+            if candidate.is_visible():
+                return candidate
+        except Exception:
+            continue
+    return None
+
+
+def _capcut_account_area_visible(page) -> bool:
+    url = str(getattr(page, "url", "") or "").lower()
+    return any(
+        marker in url
+        for marker in (
+            "/my-cloud",
+            "/my-edit",
+            "/editor",
+            "/space/",
+        )
+    )
+
+
+def _login_existing_capcut_account(
+    page,
+    account: dict,
+    stop_event,
+    step_timeout: int,
+    click_timeout: int,
+) -> None:
+    """Switch an existing signup email to login and keep the same browser tab."""
+    user = account["user"]
+    password = account["passnew"]
+    login_name = re.compile(r"^\s*(?:Log in|Sign in)\s*$", re.I)
+    continue_name = re.compile(r"^\s*Continue\s*$", re.I)
+
+    sign_in_wait_seconds = max(60.0, step_timeout / 1000.0)
+    sign_in_click_timeout = max(45000, click_timeout)
+    sign_in_deadline = time.time() + sign_in_wait_seconds
+    login_control = None
+    print(
+        f"[CAPCUT][LOGIN] Waiting up to {int(sign_in_wait_seconds)}s "
+        f"for Sign in: {user}"
+    )
+    while time.time() <= sign_in_deadline:
+        _ensure_running(stop_event, user)
+        for role in ("button", "link"):
+            login_control = _first_visible_control(page.get_by_role(role, name=login_name))
+            if login_control is not None:
+                break
+        if login_control is None:
+            login_control = _first_visible_control(page.get_by_text(login_name, exact=True))
+        if login_control is not None:
+            break
+        if _capcut_account_area_visible(page):
+            print(f"[CAPCUT][LOGIN] Login completed for {user}: {page.url}")
+            return
+        try:
+            login_form_visible = bool(
+                page.locator('input[name="username"]').first.is_visible()
+                or page.locator('input[name="password"]').first.is_visible()
+            )
+        except Exception:
+            login_form_visible = False
+        if login_form_visible:
+            break
+        _wait(0.75, stop_event, user)
+    if login_control is not None:
+        print(f"[CAPCUT][LOGIN] Sign in ready; waiting 2s before click: {user}")
+        _wait(2.0, stop_event, user)
+        try:
+            login_control.click(timeout=sign_in_click_timeout)
+        except Exception:
+            login_control.click(timeout=sign_in_click_timeout, force=True)
+        _wait(2.0, stop_event, user)
+
+    print(f"[CAPCUT][LOGIN] Existing account detected; logging in normally: {user}")
+    deadline = time.time() + max(90.0, (step_timeout / 1000.0) * 1.5)
+    password_submitted = False
+    while time.time() <= deadline:
+        _ensure_running(stop_event, user)
+        accept_capcut_cookies(page, user, stop_event, timeout=0.1)
+        if _capcut_account_area_visible(page):
+            print(f"[CAPCUT][LOGIN] Login completed for {user}: {page.url}")
+            return
+
+        email_input = page.locator('input[name="username"]').first
+        password_input = page.locator('input[name="password"]').first
+        email_visible = False
+        password_visible = False
+        try:
+            email_visible = email_input.is_visible()
+        except Exception:
+            pass
+        try:
+            password_visible = password_input.is_visible()
+        except Exception:
+            pass
+        if password_submitted and not password_visible and not any(
+            marker in str(getattr(page, "url", "")).lower()
+            for marker in ("/login", "/signup")
+        ):
+            print(f"[CAPCUT][LOGIN] Login completed for {user}: {page.url}")
+            return
+
+        if not email_visible and not password_visible:
+            continue_email = _first_visible_control(
+                page.get_by_text(
+                    re.compile(r"^\s*Continue with email\s*$", re.I),
+                    exact=True,
+                )
+            )
+            if continue_email is None:
+                continue_email = _first_visible_control(
+                    page.get_by_role(
+                        "button",
+                        name=re.compile(r"continue with email", re.I),
+                    )
+                )
+            if continue_email is not None:
+                try:
+                    continue_email.click(timeout=click_timeout)
+                except Exception:
+                    continue_email.click(timeout=click_timeout, force=True)
+                _wait(0.75, stop_event, user)
+                continue
+
+        try:
+            if email_visible:
+                current_value = str(email_input.input_value(timeout=1000) or "").strip()
+                if current_value.lower() != user.lower():
+                    email_input.fill(user)
+                continue_button = _first_visible_control(
+                    page.get_by_role("button", name=continue_name)
+                )
+                if continue_button is None:
+                    continue_button = _first_visible_control(
+                        page.locator('button[type="submit"]')
+                    )
+                if continue_button is not None:
+                    continue_button.click(timeout=click_timeout)
+                    _wait(0.75, stop_event, user)
+                    continue
+        except Exception:
+            pass
+
+        try:
+            if password_visible:
+                if password_submitted:
+                    body_text = page.locator("body").inner_text(timeout=1500).lower()
+                    if any(
+                        marker in body_text
+                        for marker in (
+                            "incorrect password",
+                            "wrong password",
+                            "invalid password",
+                            "password is incorrect",
+                        )
+                    ):
+                        raise RuntimeError(f"CapCut password was rejected for existing account {user}")
+                else:
+                    password_input.fill(password)
+                    submit = _first_visible_control(
+                        page.get_by_role(
+                            "button",
+                            name=re.compile(r"^\s*(?:Log in|Sign in|Continue)\s*$", re.I),
+                        )
+                    )
+                    if submit is None:
+                        submit = _first_visible_control(
+                            page.locator('button[type="submit"]')
+                        )
+                    if submit is not None:
+                        submit.click(timeout=click_timeout)
+                        password_submitted = True
+                        _wait(1.0, stop_event, user)
+                        continue
+                    password_input.press("Enter")
+                    password_submitted = True
+                    _wait(1.0, stop_event, user)
+                    continue
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+        _wait(0.5, stop_event, user)
+
+    raise RuntimeError(f"CapCut existing-account login was not confirmed for {user}: {page.url}")
+
+
 def run_capcut_workflow(account: dict | None = None, context: dict | None = None) -> bool:
-    """Register one CapCut account by email."""
+    """Register one CapCut account, or log it in during Reg treo if it exists."""
     if not account or not account.get("user"):
         raise RuntimeError("Missing CapCut account email")
     if not account.get("passnew"):
@@ -692,6 +1026,7 @@ def run_capcut_workflow(account: dict | None = None, context: dict | None = None
         "REGCAPCUT_FORCE_RESEND_TEST", ""
     ).strip().lower() in {"1", "true", "yes", "on"}
     session = (context or {}).get("start_result")
+    allow_existing_login = bool(getattr(session, "reg_treo", False))
     using_proxy = bool(getattr(session, "proxy", None))
     signup_step_timeout = 120000 if using_proxy else 30000
     signup_click_timeout = 30000 if using_proxy else 10000
@@ -756,13 +1091,114 @@ def run_capcut_workflow(account: dict | None = None, context: dict | None = None
         password_input.wait_for(state="visible", timeout=signup_step_timeout)
         password_input.fill(account["passnew"])
         accept_capcut_cookies(page, user, stop_event, timeout=0.1)
-        page.get_by_role("button", name="Sign up", exact=True).or_(
+        signup_button = page.get_by_role("button", name="Sign up", exact=True).or_(
             page.get_by_role("button", name="Đăng ký", exact=True)
-        ).click(timeout=signup_click_timeout)
+        )
+        visible_signup = _first_visible_control(signup_button)
+        signup_render_deadline = time.time() + min(
+            15.0,
+            max(5.0, signup_step_timeout / 1000.0),
+        )
+        while visible_signup is None and time.time() <= signup_render_deadline:
+            _ensure_running(stop_event, user)
+            visible_signup = _first_visible_control(signup_button)
+            if visible_signup is None:
+                _wait(0.25, stop_event, user)
+        if visible_signup is not None:
+            visible_signup.click(timeout=signup_click_timeout)
+        elif "/signup" in str(getattr(page, "url", "")).lower():
+            signup_submit = _first_visible_control(
+                page.locator('button[type="submit"]')
+            )
+            if signup_submit is not None:
+                signup_submit.click(timeout=signup_click_timeout)
+            else:
+                password_input.press("Enter")
+        elif allow_existing_login:
+            _login_existing_capcut_account(
+                page,
+                account,
+                stop_event,
+                signup_step_timeout,
+                signup_click_timeout,
+            )
+            account["userID"] = extract_capcut_username(
+                page,
+                user,
+                stop_event,
+                dismiss_popups=dismiss_capcut_onboarding,
+            )
+            print(f"[CAPCUT][RESULT] Existing user for {user}: {account['userID'] or 'not found'}")
+            on_registered = (context or {}).get("on_registered")
+            if on_registered is not None:
+                on_registered()
+            return True
+        else:
+            signup_button.click(timeout=signup_click_timeout)
 
         birthday_year = page.locator(
             'input[placeholder="Year"], input[placeholder="Năm"]'
         ).first
+        if allow_existing_login:
+            existing_markers = (
+                "account already exists",
+                "email already exists",
+                "email is already registered",
+                "email address has already been registered",
+            )
+            route_deadline = time.time() + max(30.0, signup_step_timeout / 1000.0)
+            existing_account = False
+            while time.time() <= route_deadline:
+                _ensure_running(stop_event, user)
+                if birthday_year.is_visible():
+                    break
+                if _capcut_account_area_visible(page):
+                    existing_account = True
+                    break
+                try:
+                    body_text = page.locator("body").inner_text(timeout=1500).lower()
+                except Exception:
+                    body_text = ""
+                login_control = _first_visible_control(
+                    page.get_by_role(
+                        "button",
+                        name=re.compile(r"^\s*(?:Log in|Sign in)\s*$", re.I),
+                    )
+                )
+                signup_still_visible = False
+                try:
+                    signup_still_visible = visible_signup.is_visible()
+                except Exception:
+                    pass
+                current_url = str(getattr(page, "url", "")).lower()
+                if any(marker in body_text for marker in existing_markers) or (
+                    "/login" in current_url
+                    and login_control is not None
+                    and not signup_still_visible
+                ):
+                    existing_account = True
+                    break
+                _wait(0.5, stop_event, user)
+            if existing_account:
+                if not _capcut_account_area_visible(page):
+                    _login_existing_capcut_account(
+                        page,
+                        account,
+                        stop_event,
+                        signup_step_timeout,
+                        signup_click_timeout,
+                    )
+                account["userID"] = extract_capcut_username(
+                    page,
+                    user,
+                    stop_event,
+                    dismiss_popups=dismiss_capcut_onboarding,
+                )
+                print(f"[CAPCUT][RESULT] Existing user for {user}: {account['userID'] or 'not found'}")
+                on_registered = (context or {}).get("on_registered")
+                if on_registered is not None:
+                    on_registered()
+                return True
         birthday_year.wait_for(state="visible", timeout=signup_step_timeout)
         print(f"[CAPCUT][SIGNUP] Birthday form ready: {user} | url={page.url}")
         _select_birthday(page, user)
@@ -777,7 +1213,8 @@ def run_capcut_workflow(account: dict | None = None, context: dict | None = None
         _otp_inputs(page).first.wait_for(state="visible", timeout=signup_step_timeout)
         used_codes: set[str] = set()
         resent_code = None
-        for attempt in range(3):
+        otp_fill_attempts = 5
+        for attempt in range(otp_fill_attempts):
             if resent_code is not None:
                 code = resent_code
                 resent_code = None
@@ -787,7 +1224,7 @@ def run_capcut_workflow(account: dict | None = None, context: dict | None = None
                     account,
                     stop_event,
                     used_codes,
-                    initial_timeout=60.0,
+                    initial_timeout=25.0,
                 )
             elif attempt == 0:
                 code = _get_capcut_code_with_resend(
@@ -795,7 +1232,9 @@ def run_capcut_workflow(account: dict | None = None, context: dict | None = None
                     account,
                     stop_event,
                     used_codes,
-                    initial_timeout=60.0,
+                    initial_timeout=25.0,
+                    max_resends=3,
+                    resent_timeout=45.0,
                 )
             else:
                 code = _wait_for_capcut_code(
@@ -805,7 +1244,10 @@ def run_capcut_workflow(account: dict | None = None, context: dict | None = None
                     timeout=120.0,
                 )
             used_codes.add(code)
-            print(f"[CAPCUT][OTP] Filling code for {user} ({attempt + 1}/3)")
+            print(
+                f"[CAPCUT][OTP] Filling code for {user} "
+                f"({attempt + 1}/{otp_fill_attempts})"
+            )
             _fill_otp(page, code)
             try:
                 accepted = _wait_for_registration_success(page, user, stop_event, timeout=15.0)
@@ -818,7 +1260,7 @@ def run_capcut_workflow(account: dict | None = None, context: dict | None = None
                     )
                     print(f"[CAPCUT][RESULT] User for {user}: {account['userID'] or 'not found'}")
                     break
-                if attempt == 2:
+                if attempt == otp_fill_attempts - 1:
                     return False
                 print(f"[CAPCUT][OTP] Code was rejected for {user}; checking for a newer code")
                 if _otp_is_visible(page):
@@ -834,7 +1276,7 @@ def run_capcut_workflow(account: dict | None = None, context: dict | None = None
             except CapCutWorkflowInterrupted:
                 raise
             except RuntimeError:
-                if attempt == 2:
+                if attempt == otp_fill_attempts - 1:
                     raise
                 print(f"[CAPCUT][OTP] Code was not accepted for {user}; checking for a newer code")
                 if _otp_is_visible(page):

@@ -17,6 +17,8 @@
 !/regcapcut_build.bat
 !/reggrok.spec
 !/cred.example.json
+!/legacy_regcapcut_v75_proxy.py
+!/REGCAPCUT_V75_VERSION.txt
 
 **/__pycache__/
 *.py[cod]

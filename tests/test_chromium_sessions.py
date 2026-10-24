@@ -11,8 +11,14 @@ from playwright.sync_api import sync_playwright
 
 from core.orchestrator import Orchestrator
 from core.settings import BrowserWindowSettings
+from modules.actions.capcut_add_link import CapCutLoginError
 from modules.browser.chromium import ChromiumSession, open_workflow_page, parse_browser_proxy, resolve_chromium_154
-from modules.ui.reg_capcut_tab import RegCapCutApp, registration_proxy_for_account
+from modules.ui.reg_capcut_tab import (
+    RegCapCutApp,
+    bounded_check_pro_threads,
+    is_transient_check_login_error,
+    registration_proxy_for_account,
+)
 
 
 class ChromiumSessionTests(unittest.TestCase):
@@ -353,6 +359,118 @@ class ChromiumSessionTests(unittest.TestCase):
             with self.assertRaises(OSError):
                 app.run_check_pro_worker({"user": "mail"}, "capcut", 0, 1, threading.Semaphore(1), 1)
         process.terminate.assert_called_once()
+
+    def test_check_pro_does_not_retry_a_definitive_login_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            app = RegCapCutApp.__new__(RegCapCutApp)
+            app.stop_event = Mock()
+            app.stop_event.is_set.return_value = False
+            app.stop_event.wait.return_value = False
+            app.active_profiles_lock = threading.Lock()
+            process = Mock()
+            app.active_standalone_processes = {"one": process}
+            app._start_account_browser = Mock(return_value=(process, object()))
+            app._save_add_link_account_state = Mock()
+            app._request_expressvpn_reset = Mock()
+            app.root = SimpleNamespace(after=lambda *args: None)
+            app.refresh_add_link_status = lambda: None
+            app.refresh_check_pro_status = lambda: None
+            app.check_pro_lock = threading.Lock()
+            app.check_pro_error_path = base / "errors.txt"
+            account = {"user": "missing@example.com", "passnew": "password"}
+
+            with patch(
+                "modules.ui.reg_capcut_tab.run_capcut_check_pro_workflow",
+                side_effect=CapCutLoginError("redirected to signup after email"),
+            ) as workflow:
+                app.run_check_pro_worker(
+                    account, "capcut", 0, 1, threading.Semaphore(1), 1
+                )
+
+            self.assertEqual(workflow.call_count, 1)
+            app._start_account_browser.assert_called_once()
+            app._request_expressvpn_reset.assert_not_called()
+            self.assertEqual(account["pro_status"], "error")
+            process.terminate.assert_called_once()
+
+    def test_check_pro_login_error_classification_and_thread_limit(self):
+        self.assertFalse(
+            is_transient_check_login_error(
+                CapCutLoginError("redirected to signup after email")
+            )
+        )
+        self.assertFalse(
+            is_transient_check_login_error(CapCutLoginError("incorrect password"))
+        )
+        self.assertTrue(
+            is_transient_check_login_error(
+                CapCutLoginError("CapCut password form did not appear")
+            )
+        )
+        self.assertTrue(is_transient_check_login_error(RuntimeError("CDP timeout")))
+        self.assertEqual(bounded_check_pro_threads(0), 1)
+        self.assertEqual(bounded_check_pro_threads(2), 2)
+        self.assertEqual(bounded_check_pro_threads(5), 3)
+
+    def test_expressvpn_reset_request_stops_counting_after_threshold(self):
+        app = RegCapCutApp.__new__(RegCapCutApp)
+        app._expressvpn_login_blocked = threading.Event()
+        app._expressvpn_login_fail_count = 0
+        app._expressvpn_login_fail_lock = threading.Lock()
+
+        for _ in range(7):
+            app._request_expressvpn_reset()
+
+        self.assertTrue(app._expressvpn_login_blocked.is_set())
+        self.assertEqual(app._expressvpn_login_fail_count, 4)
+
+    def test_check_pro_transient_retry_starts_a_fresh_browser(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            app = RegCapCutApp.__new__(RegCapCutApp)
+            app.stop_event = Mock()
+            app.stop_event.is_set.return_value = False
+            app.stop_event.wait.return_value = False
+            app.active_profiles_lock = threading.Lock()
+            first_process = Mock()
+            second_process = Mock()
+            app.active_standalone_processes = {}
+            app._start_account_browser = Mock(
+                side_effect=[(first_process, object()), (second_process, object())]
+            )
+            app._save_add_link_account_state = Mock()
+            app.root = SimpleNamespace(after=lambda *args: None)
+            app.refresh_add_link_status = lambda: None
+            app.refresh_check_pro_status = lambda: None
+            app.check_pro_lock = threading.Lock()
+            app.check_pro_path = base / "pro.txt"
+            app.check_pro_yearly_path = base / "yearly.txt"
+            app.check_pro_monthly_path = base / "monthly.txt"
+            app.check_not_pro_path = base / "not-pro.txt"
+            app.check_pro_error_path = base / "errors.txt"
+            account = {"user": "retry@example.com", "passnew": "password"}
+
+            with patch(
+                "modules.ui.reg_capcut_tab.run_capcut_check_pro_workflow",
+                side_effect=[
+                    CapCutLoginError("CapCut password form did not appear"),
+                    "yearly",
+                ],
+            ) as workflow:
+                app.run_check_pro_worker(
+                    account, "capcut", 0, 1, threading.Semaphore(1), 1
+                )
+
+            self.assertEqual(workflow.call_count, 2)
+            self.assertEqual(app._start_account_browser.call_count, 2)
+            self.assertIsNot(
+                workflow.call_args_list[0].args[1]["start_result"],
+                workflow.call_args_list[1].args[1]["start_result"],
+            )
+            self.assertEqual(account["pro_status"], "yearly")
+            first_process.terminate.assert_called_once()
+            second_process.terminate.assert_called_once()
 
     def test_yearly_check_writes_total_and_yearly_result_files(self):
         with tempfile.TemporaryDirectory() as directory:
