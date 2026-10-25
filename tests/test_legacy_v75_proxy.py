@@ -11,10 +11,10 @@ import legacy_regcapcut_v75_proxy as legacy_patch
 
 
 class LegacyV75RegistrationPatchTests(unittest.TestCase):
-    def test_patch_version_is_75100(self):
-        self.assertEqual(legacy_patch.LEGACY_PATCH_VERSION, "7.5.100")
+    def test_patch_version_is_75200(self):
+        self.assertEqual(legacy_patch.LEGACY_PATCH_VERSION, "7.5.200")
         version_file = Path(__file__).resolve().parents[1] / "REGCAPCUT_V75_VERSION.txt"
-        self.assertEqual(version_file.read_text(encoding="utf-8").strip(), "7.5.100")
+        self.assertEqual(version_file.read_text(encoding="utf-8").strip(), "7.5.200")
 
     def test_only_explicit_22000_vnd_offer_is_accepted(self):
         accepted = ("22,000đ", "22000d", "₫22000", "22.000 VND")
@@ -33,6 +33,17 @@ class LegacyV75RegistrationPatchTests(unittest.TestCase):
         for text in rejected:
             with self.subTest(text=text):
                 self.assertFalse(legacy_patch._has_discounted_22000_price(text))
+
+    def test_monthly_context_accepts_current_slash_month_ui(self):
+        accepted = ("Monthly", "22,000đ /month", "22.000 VND per month", "Hàng tháng")
+        rejected = ("Yearly", "One year", "222,000đ")
+
+        for text in accepted:
+            with self.subTest(text=text):
+                self.assertTrue(legacy_patch._is_monthly_price_context(text))
+        for text in rejected:
+            with self.subTest(text=text):
+                self.assertFalse(legacy_patch._is_monthly_price_context(text))
 
     def test_checkout_requires_due_today_22000(self):
         self.assertTrue(
@@ -71,9 +82,38 @@ class LegacyV75RegistrationPatchTests(unittest.TestCase):
         self.assertIn("link.target = '_blank'", source)
         self.assertNotIn("browser_context.new_page()", fallback_source)
         self.assertLess(
-            source.index('attempt_checkout(workspace_page, "registered tab")'),
+            source.index("stop_when_popup_opens=True"),
             source.index("def open_adjacent_tab_from_workspace"),
         )
+
+    def test_primary_popup_stops_before_five_fallback_tabs(self):
+        source = inspect.getsource(legacy_patch.open_pro_checkout_across_five_tabs)
+        primary_attempt = source[
+            source.index("# Always use the just-registered incognito tab first") :
+            source.index("def open_adjacent_tab_from_workspace")
+        ]
+
+        self.assertIn("stop_when_popup_opens=True", primary_attempt)
+        self.assertIn("skipping all 5 fallback tabs", source)
+        self.assertLess(
+            source.index("if stop_when_popup_opens:"),
+            source.index("verified_checkout = False"),
+        )
+
+    def test_primary_offer_scan_uses_two_short_attempts_then_fallback(self):
+        source = inspect.getsource(legacy_patch.open_pro_checkout_across_five_tabs)
+        primary_flow = source[
+            source.index("# Always use the just-registered incognito tab first") :
+            source.index("def open_adjacent_tab_from_workspace")
+        ]
+
+        self.assertIn('progress["plan_action_clicked"] = True', source)
+        self.assertIn('primary_progress.get("plan_action_clicked")', primary_flow)
+        self.assertIn("for primary_attempt in range(1, 3)", primary_flow)
+        self.assertIn("after 2 reloads", primary_flow)
+        self.assertNotIn("refusing to open fallback tabs", primary_flow)
+        self.assertIn("find_pro_button(page, timeout=10)", source)
+        self.assertIn("did not appear within 10 seconds", source)
 
     def test_checkout_switches_yearly_pricing_to_monthly_before_plan_scan(self):
         source = inspect.getsource(legacy_patch.open_pro_checkout_across_five_tabs)
@@ -81,17 +121,26 @@ class LegacyV75RegistrationPatchTests(unittest.TestCase):
         self.assertIn("Switched pricing from Yearly to Monthly", source)
         self.assertIn("Monthly|Theo tháng", source)
         self.assertIn("Selected 22,000d Monthly offer", source)
-        self.assertIn("Found black Update in exact", source)
+        self.assertIn("Found black Upgrade in exact", source)
+        self.assertIn("22,000d/month Pro card", source)
+        self.assertIn("hasAmount(text, '22000')", source)
+        self.assertNotIn("normalize-space()='Update'", source)
         self.assertIn("ancestor-or-self::*[self::button or", source)
         self.assertIn("Purchase|Buy now|Mua|Thanh toán", source)
         self.assertNotIn("free_trial_fallback", source)
         self.assertNotIn('titles = page.get_by_text', source)
+        self.assertIn("def dismiss_discount_offer_popup", source)
+        self.assertIn("Dismissed blocking Get offer popup", source)
+        self.assertIn("dismiss_discount_offer_popup(page, timeout=6)", source)
+        self.assertIn('div.lv-modal', source)
+        self.assertIn('lv-modal-close-icon[role="button"][aria-label="Close"]', source)
+        self.assertNotIn("click_control(get_offer", source)
         self.assertLess(
             source.index("monthly_selected = select_monthly_pricing(page)"),
             source.index("monthly_prices = page.get_by_text"),
         )
         self.assertLess(
-            source.index("Found black Update in exact"),
+            source.index("Found black Upgrade in exact"),
             source.index("# The newer pricing sheet uses one shared Purchase action"),
         )
 
@@ -105,10 +154,11 @@ class LegacyV75RegistrationPatchTests(unittest.TestCase):
 
         self.assertIn('page.reload(wait_until="domcontentloaded"', source)
         self.assertLess(
-            source.index('attempt_checkout(workspace_page, "registered tab")'),
+            source.index("stop_when_popup_opens=True"),
             source.index("for reload_round in range(1, 3)"),
         )
-        self.assertIn('attempt_checkout(workspace_page, "registered tab")', source)
+        self.assertIn("workspace_page,", source)
+        self.assertIn("stop_when_popup_opens=True", source)
         self.assertIn("Reloading all 5 fallback tabs", source)
         self.assertIn("for reload_round in range(1, 3)", source)
         self.assertIn("reload_before_upgrade(page, location)", source)
@@ -116,12 +166,16 @@ class LegacyV75RegistrationPatchTests(unittest.TestCase):
         self.assertIn("time.sleep(1)", source)
         fallback_rounds = source[source.index("for reload_round in range(1, 3)") :]
         self.assertNotIn("page.wait_for_timeout(1000)", fallback_rounds)
+        self.assertNotIn("page.wait_for_timeout", fallback_rounds)
+        self.assertNotIn("checkout_popup.wait_for_timeout", source)
         self.assertLess(
             source.index("for tab_number, (page, _navigation_error)"),
             source.index("for tab_number, (page, reload_error)"),
         )
         self.assertIn("def wait_for_top_upgrade(page, timeout=60)", source)
         self.assertIn("def find_pro_button(page, timeout=60)", source)
+        self.assertIn("deadline = time.time() + 5", attempt_source)
+        self.assertIn("checkout popup did not open within 5 seconds", attempt_source)
         self.assertIn("amount_deadline = time.time() + 30", source)
 
     def test_five_tab_checkout_requires_original_incognito_context(self):
@@ -253,10 +307,13 @@ class LegacyV75RegistrationPatchTests(unittest.TestCase):
         self.assertIn("initial_timeout: float = 25.0", resend_source)
         self.assertIn("max_resends: int = 3", resend_source)
         self.assertIn("resent_timeout: float = 45.0", resend_source)
+        self.assertIn("previous_fingerprints: set[str] | None = None", resend_source)
         self.assertIn("for resend_attempt in range(1, max_resends + 1)", resend_source)
         self.assertIn("_wait(1.0, stop_event, user)", poll_source)
         self.assertIn("otp_fill_attempts = 5", workflow_source)
         self.assertIn("initial_timeout=25.0", workflow_source)
+        self.assertIn("otp_message_fingerprints = _capcut_message_fingerprints", workflow_source)
+        self.assertIn("previous_fingerprints=otp_message_fingerprints", workflow_source)
 
 
 if __name__ == "__main__":

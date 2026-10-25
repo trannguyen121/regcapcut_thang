@@ -25,7 +25,7 @@ from urllib.parse import unquote, urlsplit
 LEGACY_ENTRY_NAME = "reg_capcut_tab.pyc"
 LEGACY_PYZ_NAME = "PYZ.pyz"
 MODERN_WORKFLOW_NAME = "capcut_workflow.py"
-LEGACY_PATCH_VERSION = "7.5.100"
+LEGACY_PATCH_VERSION = "7.5.200"
 _PENDING_PROXY_KEY = "_v75_pending_proxy"
 _WINDOW_SLOT_KEY = "_v75_window_slot"
 _WINDOW_TOTAL_KEY = "_v75_window_total"
@@ -33,6 +33,10 @@ _WINDOW_TOTAL_KEY = "_v75_window_total"
 
 _DISCOUNTED_22000_PRICE_PATTERN = re.compile(
     r"^\s*(?:₫\s*22[.,\s]?000|22[.,\s]?000\s*(?:₫|đ|d|vnd))\s*$",
+    re.I,
+)
+_MONTHLY_BILLING_PATTERN = re.compile(
+    r"(?:\bMonthly\b|Hàng\s+tháng|/\s*month\b|per\s+month\b|Mỗi\s+tháng)",
     re.I,
 )
 _CHECKOUT_DUE_22000_PATTERN = re.compile(
@@ -50,6 +54,11 @@ _CHECKOUT_FIRST_MONTH_22000_PATTERN = re.compile(
 def _has_discounted_22000_price(text) -> bool:
     """Accept only the explicit 22,000 VND offer, never 222,000 or 0 VND."""
     return bool(_DISCOUNTED_22000_PRICE_PATTERN.fullmatch(str(text or "")))
+
+
+def _is_monthly_price_context(text) -> bool:
+    """Recognize both the old ``Monthly`` label and the new ``/month`` UI."""
+    return bool(_MONTHLY_BILLING_PATTERN.search(str(text or "")))
 
 
 def _checkout_due_today_is_22000(text) -> bool:
@@ -699,7 +708,7 @@ def open_pro_trial_after_registration(account, context, original_workflow, check
 
 
 def open_pro_checkout_across_five_tabs(account, context, original_workflow):
-    """Open five editor tabs and stop at the first stable Pro checkout popup."""
+    """Try the registered tab first and open fallback tabs only if no popup appears."""
     workflow_globals = original_workflow.__globals__
     sync_playwright = workflow_globals["sync_playwright"]
     connect_browser = workflow_globals["_connect_browser"]
@@ -712,7 +721,7 @@ def open_pro_checkout_across_five_tabs(account, context, original_workflow):
     ):
         raise RuntimeError("Reg treo checkout requires Chrome's original incognito window")
     upgrade_pattern = re.compile(r"^\s*(Upgrade|Nâng cấp)\s*$", re.I)
-    plan_update_pattern = re.compile(r"^\s*(Update|Cập nhật)\s*$", re.I)
+    plan_upgrade_pattern = re.compile(r"^\s*(Upgrade|Nâng cấp)\s*$", re.I)
 
     with sync_playwright() as playwright:
         browser = connect_browser(playwright, cdp_url, user, stop_event)
@@ -817,13 +826,114 @@ def open_pro_checkout_across_five_tabs(account, context, original_workflow):
                             # replaced while CapCut hydrates. A stale Skip
                             # control must not abort the checkout attempt.
                             continue
-                        page.wait_for_timeout(300)
+                        time.sleep(0.3)
                         clicked = True
                         break
                     if clicked:
                         break
                 if not clicked:
                     return
+
+        def dismiss_discount_offer_popup(page, timeout=0):
+            """Close the nested Get-offer promotion without closing pricing."""
+            deadline = time.time() + max(0, timeout)
+            while True:
+                # Verified against the live CapCut DOM: the nested campaign is
+                # an lv-modal and its X is a role=button span with aria-label
+                # Close. Scope the selector by offer copy so the outer pricing
+                # modal's own close control can never be selected.
+                try:
+                    promo_modals = page.locator("div.lv-modal").filter(
+                        has_text=re.compile(r"Get\s+Pro\s+at\s+\d+%\s+OFF", re.I)
+                    )
+                    for modal_index in range(promo_modals.count() - 1, -1, -1):
+                        promo_modal = promo_modals.nth(modal_index)
+                        if not promo_modal.is_visible():
+                            continue
+                        close_control = promo_modal.locator(
+                            '.lv-modal-close-icon[role="button"][aria-label="Close"], '
+                            '[role="button"][aria-label="Close"]'
+                        ).first
+                        if close_control.count() and close_control.is_visible():
+                            click_control(close_control)
+                            print(
+                                f"[REG TREO][PRO] Dismissed blocking Get offer "
+                                f"popup for {user} via live DOM selector"
+                            )
+                            time.sleep(0.5)
+                            return True
+                except Exception:
+                    pass
+                try:
+                    dismissed = bool(
+                        page.evaluate(
+                            r"""() => {
+                                const visible = (element) => {
+                                    const style = getComputedStyle(element);
+                                    const box = element.getBoundingClientRect();
+                                    return style.display !== 'none' &&
+                                        style.visibility !== 'hidden' &&
+                                        Number(style.opacity || 1) > 0 &&
+                                        box.width > 0 && box.height > 0;
+                                };
+                                const offerTitle = /get\s+pro\s+at\s+\d+%\s+off/i;
+                                const offerAction = /^get\s+offer$/i;
+                                const roots = Array.from(document.querySelectorAll('body *'))
+                                    .filter((element) => {
+                                        if (!visible(element)) return false;
+                                        const text = (element.innerText || '').trim();
+                                        if (!offerTitle.test(text) || !/get\s+offer/i.test(text)) {
+                                            return false;
+                                        }
+                                        const box = element.getBoundingClientRect();
+                                        return box.width >= 280 && box.width <= 760 &&
+                                            box.height >= 240 && box.height <= 760;
+                                    })
+                                    .sort((left, right) => {
+                                        const a = left.getBoundingClientRect();
+                                        const b = right.getBoundingClientRect();
+                                        return a.width * a.height - b.width * b.height;
+                                    });
+                                for (const root of roots) {
+                                    const rootBox = root.getBoundingClientRect();
+                                    const candidates = Array.from(root.querySelectorAll(
+                                        'button, [role="button"], [aria-label], '
+                                        + '[class*="close" i], svg'
+                                    ));
+                                    for (const candidate of candidates) {
+                                        if (!visible(candidate)) continue;
+                                        const label = (
+                                            candidate.getAttribute('aria-label') ||
+                                            candidate.getAttribute('title') ||
+                                            candidate.innerText || ''
+                                        ).trim();
+                                        if (offerAction.test(label)) continue;
+                                        const box = candidate.getBoundingClientRect();
+                                        const centerX = box.left + box.width / 2;
+                                        const centerY = box.top + box.height / 2;
+                                        const inTopRight = centerX >= rootBox.left + rootBox.width * 0.72 &&
+                                            centerY <= rootBox.top + Math.min(120, rootBox.height * 0.35);
+                                        const closeSized = box.width >= 8 && box.height >= 8 &&
+                                            box.width <= 80 && box.height <= 80;
+                                        if (!inTopRight || !closeSized) continue;
+                                        const target = candidate.closest('button, [role="button"]') || candidate;
+                                        target.click();
+                                        return true;
+                                    }
+                                }
+                                return false;
+                            }"""
+                        )
+                    )
+                except Exception:
+                    dismissed = False
+                if dismissed:
+                    print(f"[REG TREO][PRO] Dismissed blocking Get offer popup for {user}")
+                    time.sleep(0.5)
+                    return True
+                if time.time() >= deadline:
+                    return False
+                time.sleep(0.25)
 
         def wait_for_top_upgrade(page, timeout=60):
             deadline = time.time() + timeout
@@ -845,7 +955,7 @@ def open_pro_checkout_across_five_tabs(account, context, original_workflow):
                     except Exception:
                         pass
                     return candidate
-                page.wait_for_timeout(500)
+                time.sleep(0.5)
             return None
 
         def select_monthly_pricing(page):
@@ -881,7 +991,7 @@ def open_pro_checkout_across_five_tabs(account, context, original_workflow):
                 except Exception:
                     continue
                 print(f"[REG TREO][PRO] Switched pricing from Yearly to Monthly for {user}")
-                page.wait_for_timeout(1500)
+                time.sleep(1.5)
                 return True
             return False
 
@@ -895,6 +1005,8 @@ def open_pro_checkout_across_five_tabs(account, context, original_workflow):
                 re.I,
             )
             while time.time() < deadline:
+                if dismiss_discount_offer_popup(page):
+                    monthly_selected = False
                 if not monthly_selected:
                     monthly_selected = select_monthly_pricing(page)
 
@@ -914,7 +1026,7 @@ def open_pro_checkout_across_five_tabs(account, context, original_workflow):
                             click_control(learn_more)
                             promotion_opened = True
                             print(f"[REG TREO][PRO] Opened delayed pricing promotion for {user}")
-                            page.wait_for_timeout(1500)
+                            time.sleep(1.5)
                             continue
                         except Exception:
                             pass
@@ -935,7 +1047,7 @@ def open_pro_checkout_across_five_tabs(account, context, original_workflow):
                         )
                     except Exception:
                         price_context = ""
-                    if price_context and not re.search(r"Monthly|Hàng tháng", price_context, re.I):
+                    if price_context and not _is_monthly_price_context(price_context):
                         # The price and billing label can be sibling nodes one
                         # level higher, so inspect a few compact ancestors.
                         for ancestor_level in range(2, 6):
@@ -945,9 +1057,9 @@ def open_pro_checkout_across_five_tabs(account, context, original_workflow):
                                 ).inner_text(timeout=1500)
                             except Exception:
                                 continue
-                            if re.search(r"Monthly|Hàng tháng", price_context, re.I):
+                            if _is_monthly_price_context(price_context):
                                 break
-                    if price_context and not re.search(r"Monthly|Hàng tháng", price_context, re.I):
+                    if price_context and not _is_monthly_price_context(price_context):
                         continue
                     try:
                         monthly_choice = monthly_price.locator(
@@ -960,18 +1072,16 @@ def open_pro_checkout_across_five_tabs(account, context, original_workflow):
                     except Exception:
                         continue
                     print(f"[REG TREO][PRO] Selected 22,000d Monthly offer for {user}")
-                    page.wait_for_timeout(750)
+                    time.sleep(0.75)
 
-                    # Older pricing cards expose a black Update/Upgrade
+                    # The pricing card exposes a black Upgrade control.
                     # control that can be a div rather than a real button.
                     # Resolve it from the exact visible 22,000 VND price node
                     # so an adjacent 222,000 VND card can never be selected.
                     card = monthly_price.locator(
                         "xpath=ancestor::div["
                         ".//*[normalize-space()='Pro'] and "
-                        ".//*[normalize-space()='Update' or "
-                        "normalize-space()='Cập nhật' or "
-                        "normalize-space()='Upgrade' or "
+                        ".//*[normalize-space()='Upgrade' or "
                         "normalize-space()='Nâng cấp']][1]"
                     )
                     try:
@@ -980,20 +1090,12 @@ def open_pro_checkout_across_five_tabs(account, context, original_workflow):
                         card_is_visible = False
                     if card_is_visible:
                         plan_control = visible_enabled(
-                            card.get_by_role("button", name=plan_update_pattern)
+                            card.get_by_role("button", name=plan_upgrade_pattern)
                         )
                         if plan_control is None:
-                            plan_control = visible_enabled(
-                                card.get_by_role("button", name=upgrade_pattern)
-                            )
-                        if plan_control is None:
                             plan_text = visible_enabled(
-                                card.get_by_text(plan_update_pattern, exact=True)
+                                card.get_by_text(plan_upgrade_pattern, exact=True)
                             )
-                            if plan_text is None:
-                                plan_text = visible_enabled(
-                                    card.get_by_text(upgrade_pattern, exact=True)
-                                )
                             if plan_text is not None:
                                 try:
                                     clickable = plan_text.locator(
@@ -1008,10 +1110,79 @@ def open_pro_checkout_across_five_tabs(account, context, original_workflow):
                                     plan_control = plan_text
                         if plan_control is not None:
                             print(
-                                f"[REG TREO][PRO] Found black Update in exact "
+                                f"[REG TREO][PRO] Found black Upgrade in exact "
                                 f"22,000d Pro card for {user}"
                             )
                             return plan_control
+
+                    # CapCut now splits the price and /month label across
+                    # nested React nodes. In that DOM, locating an exact price
+                    # node and climbing with XPath is unreliable. Scan visible
+                    # Upgrade controls and accept one only when a compact
+                    # ancestor is the Pro card and contains both 222,000 and
+                    # the discounted 22,000 monthly price.
+                    for upgrade_candidates in (
+                        page.get_by_role("button", name=plan_upgrade_pattern),
+                        page.get_by_text(plan_upgrade_pattern, exact=True),
+                    ):
+                        try:
+                            candidate_count = min(upgrade_candidates.count(), 20)
+                        except Exception:
+                            candidate_count = 0
+                        for candidate_index in range(candidate_count):
+                            candidate = upgrade_candidates.nth(candidate_index)
+                            try:
+                                if not candidate.is_visible():
+                                    continue
+                                in_exact_pro_card = bool(
+                                    candidate.evaluate(
+                                        r"""(element) => {
+                                            const visible = (node) => {
+                                                const style = getComputedStyle(node);
+                                                const box = node.getBoundingClientRect();
+                                                return style.display !== 'none' &&
+                                                    style.visibility !== 'hidden' &&
+                                                    Number(style.opacity || 1) > 0 &&
+                                                    box.width > 0 && box.height > 0;
+                                            };
+                                            const hasAmount = (text, amount) => {
+                                                const compact = text.replace(/[.,\s\u00a0]/g, '');
+                                                return new RegExp('(?:^|[^0-9])' + amount + '(?:[^0-9]|$)')
+                                                    .test(compact);
+                                            };
+                                            for (let node = element; node && node !== document.body;
+                                                 node = node.parentElement) {
+                                                if (!visible(node)) continue;
+                                                const box = node.getBoundingClientRect();
+                                                if (box.width > innerWidth * 0.62) continue;
+                                                const text = (node.innerText || '').trim();
+                                                if (!/(^|\n)\s*Pro\s*(\n|$)/i.test(text)) continue;
+                                                if (!hasAmount(text, '22000') || !hasAmount(text, '222000')) continue;
+                                                if (!/(?:\bmonthly\b|\/\s*month\b|per\s+month\b|hàng\s+tháng|mỗi\s+tháng)/i.test(text)) continue;
+                                                return true;
+                                            }
+                                            return false;
+                                        }"""
+                                    )
+                                )
+                            except Exception:
+                                continue
+                            if not in_exact_pro_card:
+                                continue
+                            try:
+                                clickable = candidate.locator(
+                                    "xpath=ancestor-or-self::*[self::button or "
+                                    "@role='button' or @tabindex][1]"
+                                )
+                                if clickable.count() and clickable.is_visible():
+                                    candidate = clickable
+                            except Exception:
+                                pass
+                            print(
+                                f"[REG TREO][PRO] Found black Upgrade in exact "
+                                f"22,000d/month Pro card for {user}"
+                            )
+                            return candidate
 
                     # The newer pricing sheet uses one shared Purchase action
                     # after the exact Monthly 22,000 VND option is selected.
@@ -1039,7 +1210,7 @@ def open_pro_checkout_across_five_tabs(account, context, original_workflow):
                                 purchase = purchase_text
                     if purchase is not None:
                         return purchase
-                page.wait_for_timeout(500)
+                time.sleep(0.5)
             return None
 
         def reload_before_upgrade(page, location):
@@ -1054,14 +1225,23 @@ def open_pro_checkout_across_five_tabs(account, context, original_workflow):
                 except Exception:
                     pass
                 raise RuntimeError(f"reload before Upgrade failed: {exc}") from exc
-            page.wait_for_timeout(2500)
+            time.sleep(2.5)
             dismiss_overlays(page)
             if not is_account_workspace(page.url):
                 raise RuntimeError(f"reload left authenticated workspace: {page.url}")
             print(f"[REG TREO][PRO] Reloaded {location}; waiting for Upgrade for {user}")
 
-        def attempt_checkout(page, location, reload_before=True):
+        def attempt_checkout(
+            page,
+            location,
+            reload_before=True,
+            stop_when_popup_opens=False,
+            progress=None,
+        ):
             """Click only the verified offer and require a stable checkout."""
+            progress = progress if progress is not None else {}
+            progress["top_upgrade_clicked"] = False
+            progress["plan_action_clicked"] = False
             if reload_before:
                 reload_before_upgrade(page, location)
             else:
@@ -1071,13 +1251,10 @@ def open_pro_checkout_across_five_tabs(account, context, original_workflow):
             if top_upgrade is None:
                 raise RuntimeError("top Upgrade did not appear within 60 seconds")
             click_control(top_upgrade)
+            progress["top_upgrade_clicked"] = True
             print(f"[REG TREO][PRO] Clicked top Upgrade on {location} for {user}")
-            page.wait_for_timeout(1500)
-
-            get_offer = page.get_by_role("button", name=re.compile(r"^\s*Get offer\s*$", re.I))
-            if get_offer.count() and get_offer.first.is_visible():
-                click_control(get_offer.first)
-                page.wait_for_timeout(1500)
+            time.sleep(1.5)
+            dismiss_discount_offer_popup(page, timeout=6)
 
             # Some accounts first receive a compact CapCut Pro promotion
             # instead of the pricing sheet. Open its Learn more action before
@@ -1089,20 +1266,21 @@ def open_pro_checkout_across_five_tabs(account, context, original_workflow):
             if learn_more.count() and learn_more.first.is_visible():
                 click_control(learn_more.first)
                 print(f"[REG TREO][PRO] Opened pricing from Learn more on {location} for {user}")
-                page.wait_for_timeout(1500)
+                time.sleep(1.5)
 
-            pro_button = find_pro_button(page)
+            pro_button = find_pro_button(page, timeout=10)
             if pro_button is None:
-                raise RuntimeError("22,000 VND monthly Pro action did not appear within 60 seconds")
+                raise RuntimeError("22,000 VND monthly Pro action did not appear within 10 seconds")
 
             pages_before = [candidate for item in browser.contexts for candidate in item.pages]
             event_offset = len(opened_pages)
             click_control(pro_button)
-            print(f"[REG TREO][PRO] Clicked 22,000d Monthly Update/Purchase on {location} for {user}")
+            progress["plan_action_clicked"] = True
+            print(f"[REG TREO][PRO] Clicked 22,000d Monthly Upgrade/Purchase on {location} for {user}")
 
             checkout_popup = None
             learn_more_handled = False
-            deadline = time.time() + 30
+            deadline = time.time() + 5
             while time.time() < deadline:
                 checkout_popup = next(
                     (
@@ -1127,14 +1305,26 @@ def open_pro_checkout_across_five_tabs(account, context, original_workflow):
                     if learn_more.count() and learn_more.first.is_visible():
                         click_control(learn_more.first)
                         learn_more_handled = True
-                        page.wait_for_timeout(750)
+                        time.sleep(0.75)
                         pro_button = find_pro_button(page, timeout=10)
                         if pro_button is not None:
                             click_control(pro_button)
-                page.wait_for_timeout(500)
+                time.sleep(0.5)
 
             if checkout_popup is None:
-                raise RuntimeError("checkout popup did not open within 30 seconds")
+                raise RuntimeError("checkout popup did not open within 5 seconds")
+
+            # The registered tab is always the primary attempt. Once its exact
+            # 22,000 VND Upgrade/Purchase action opens checkout, leave that
+            # popup untouched and stop the automation immediately. In
+            # particular, do not let slow checkout rendering or a later popup
+            # close trigger creation of the five fallback tabs.
+            if stop_when_popup_opens:
+                print(
+                    f"[REG TREO][PRO] Checkout popup opened from {location} "
+                    f"for {user}; skipping all 5 fallback tabs"
+                )
+                return
 
             verified_checkout = False
             checkout_text = ""
@@ -1149,7 +1339,7 @@ def open_pro_checkout_across_five_tabs(account, context, original_workflow):
                 if _checkout_due_today_is_22000(checkout_text):
                     verified_checkout = True
                     break
-                checkout_popup.wait_for_timeout(500)
+                time.sleep(0.5)
             if not verified_checkout:
                 try:
                     checkout_popup.close()
@@ -1170,25 +1360,56 @@ def open_pro_checkout_across_five_tabs(account, context, original_workflow):
             while time.time() < stability_deadline:
                 if checkout_popup.is_closed():
                     raise RuntimeError("checkout popup closed unexpectedly")
-                page.wait_for_timeout(500)
+                time.sleep(0.5)
             print(
                 f"[REG TREO][PRO] Checkout popup stable from {location} "
                 f"for {user}; entering hold mode"
             )
 
-        # Always use the just-registered incognito tab first. Only create the
-        # five adjacent fallback tabs if this first checkout attempt fails.
-        try:
-            if bool((context or {}).get("force_first_checkout_failure")):
-                raise RuntimeError("forced first checkout failure for E2E")
-            attempt_checkout(workspace_page, "registered tab")
-            return
-        except Exception as exc:
-            safe_error = str(exc).encode("ascii", "replace").decode("ascii")
-            print(
-                f"[REG TREO][PRO] Registered tab did not produce a stable popup "
-                f"for {user}: {safe_error}; opening 5 incognito fallback tabs"
-            )
+        # Always use the just-registered incognito tab first. Scan the pricing
+        # sheet for only 10 seconds per reload and try the registered tab twice.
+        # If the exact offer still does not appear, continue with the five
+        # sibling tabs; never click a different price just to make progress.
+        force_first_failure = bool((context or {}).get("force_first_checkout_failure"))
+        if force_first_failure:
+            print(f"[REG TREO][PRO] Forced first checkout failure for E2E: {user}")
+        else:
+            for primary_attempt in range(1, 3):
+                primary_progress = {}
+                try:
+                    attempt_checkout(
+                        workspace_page,
+                        f"registered tab attempt {primary_attempt}/2",
+                        stop_when_popup_opens=True,
+                        progress=primary_progress,
+                    )
+                    return
+                except Exception as exc:
+                    safe_error = str(exc).encode("ascii", "replace").decode("ascii")
+                    if primary_progress.get("plan_action_clicked"):
+                        print(
+                            f"[REG TREO][PRO] Registered tab clicked 22,000d Upgrade "
+                            f"but no checkout popup appeared for {user}: {safe_error}; "
+                            f"opening 5 incognito fallback tabs"
+                        )
+                        break
+                    print(
+                        f"[REG TREO][PRO] Registered tab has not clicked 22,000d "
+                        f"Upgrade for {user} (attempt {primary_attempt}/2): {safe_error}"
+                    )
+                    if primary_attempt < 2:
+                        print(
+                            f"[REG TREO][PRO] Retrying the registered tab before "
+                            f"any fallback tab is allowed for {user}"
+                        )
+                        time.sleep(1)
+                        continue
+                    print(
+                        f"[REG TREO][PRO] Exact 22,000d offer was not found on "
+                        f"the registered tab after 2 reloads for {user}; "
+                        f"opening 5 incognito fallback tabs"
+                    )
+                    break
 
         def open_adjacent_tab_from_workspace(tab_number):
             """Open a real sibling tab from the registered tab, never a new window."""
@@ -1247,13 +1468,13 @@ def open_pro_checkout_across_five_tabs(account, context, original_workflow):
                 except Exception as exc:
                     navigation_error = exc
                 if navigation_attempt < 2:
-                    page.wait_for_timeout(2000)
+                    time.sleep(2)
             if navigation_error is not None:
                 safe_error = str(navigation_error).encode("ascii", "replace").decode("ascii")
                 print(f"[REG TREO][PRO] Tab {tab_number}/5 navigation warning for {user}: {safe_error}")
             candidate_tabs.append((page, navigation_error))
             print(f"[REG TREO][PRO] Opened adjacent workspace tab {tab_number}/5 for {user}")
-            page.wait_for_timeout(1200)
+            time.sleep(1.2)
 
         failures = []
         for reload_round in range(1, 3):

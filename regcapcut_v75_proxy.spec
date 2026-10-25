@@ -41,7 +41,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='regcapcut_v7.5.100',
+    name='regcapcut_v7.5.200',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -60,5 +60,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='regcapcut_v7.5.100',
+    name='regcapcut_v7.5.200',
 )

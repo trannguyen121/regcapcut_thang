@@ -324,13 +324,19 @@ def _resend_capcut_code(page, user: str, stop_event, timeout: float = 75.0) -> N
     print(f"[CAPCUT][OTP] Waiting for Resend to become available for {user}")
     deadline = time.time() + timeout
     last_error = None
+    resend_pattern = re.compile(
+        r"(?:resend|send\s+(?:the\s+)?code\s+again|send\s+again|"
+        r"get\s+(?:a\s+)?new\s+code|request\s+(?:a\s+)?new\s+code|"
+        r"gá»­i\s+láº¡i|gá»­i\s+láº¡i\s+mÃ£)",
+        re.IGNORECASE,
+    )
     while time.time() <= deadline:
         _ensure_running(stop_event, user)
         candidates = (
-            page.get_by_role("button", name=re.compile(r"resend", re.IGNORECASE)),
-            page.locator('button:has-text("Resend")'),
-            page.locator('[role="button"]:has-text("Resend")'),
-            page.get_by_text(re.compile(r"^resend", re.IGNORECASE)),
+            page.get_by_role("button", name=resend_pattern),
+            page.get_by_role("link", name=resend_pattern),
+            page.locator("button, [role='button'], a").filter(has_text=resend_pattern),
+            page.get_by_text(resend_pattern),
         )
         for candidates_group in candidates:
             try:
@@ -350,6 +356,15 @@ def _resend_capcut_code(page, user: str, stop_event, timeout: float = 75.0) -> N
                         continue
                     if hasattr(candidate, "is_enabled") and not candidate.is_enabled():
                         continue
+                    try:
+                        clickable = candidate.locator(
+                            "xpath=ancestor-or-self::*[self::button or self::a or "
+                            "@role='button' or @tabindex][1]"
+                        )
+                        if clickable.count() and clickable.is_visible():
+                            candidate = clickable
+                    except Exception:
+                        pass
                     candidate.click(timeout=3000)
                     print(f"[CAPCUT][OTP] Requested a new verification code for {user}")
                     return
@@ -367,16 +382,19 @@ def _get_capcut_code_with_resend(
     initial_timeout: float = 25.0,
     max_resends: int = 3,
     resent_timeout: float = 45.0,
+    previous_fingerprints: set[str] | None = None,
 ) -> str:
     """Read the first code, then retry Resend as soon as CapCut allows it."""
     user = account["user"]
     try:
-        return _wait_for_capcut_code(
-            account,
-            stop_event,
-            excluded,
-            timeout=initial_timeout,
-        )
+        if previous_fingerprints is not None:
+            return _wait_for_resent_capcut_code(
+                account,
+                stop_event,
+                previous_fingerprints,
+                timeout=initial_timeout,
+            )
+        return _wait_for_capcut_code(account, stop_event, excluded, timeout=initial_timeout)
     except CapCutWorkflowInterrupted:
         raise
     except RuntimeError as first_error:
@@ -1208,6 +1226,14 @@ def run_capcut_workflow(account: dict | None = None, context: dict | None = None
         continue_button.wait_for(state="visible", timeout=5000)
         if not continue_button.is_enabled():
             raise RuntimeError(f"CapCut birthday form is incomplete for {user}")
+        # Snapshot prior CapCut messages before requesting this registration's
+        # OTP. This prevents an old six-digit code from an earlier run being
+        # submitted immediately and rejected as expired.
+        try:
+            otp_message_fingerprints = _capcut_message_fingerprints(_get_messages(account))
+        except Exception as exc:
+            otp_message_fingerprints = None
+            print(f"[CAPCUT][OTP] Could not snapshot existing mail for {user}: {exc}")
         continue_button.click(timeout=signup_click_timeout)
 
         _otp_inputs(page).first.wait_for(state="visible", timeout=signup_step_timeout)
@@ -1235,6 +1261,7 @@ def run_capcut_workflow(account: dict | None = None, context: dict | None = None
                     initial_timeout=25.0,
                     max_resends=3,
                     resent_timeout=45.0,
+                    previous_fingerprints=otp_message_fingerprints,
                 )
             else:
                 code = _wait_for_capcut_code(
