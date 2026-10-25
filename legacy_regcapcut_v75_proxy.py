@@ -1527,6 +1527,15 @@ def patch_hold_proxy(namespace, registration_workflow=None):
 
     def versioned_init(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
+        # A packaged release carries Chrome 154 under PyInstaller's resource
+        # directory. Prefer it so the portable folder does not depend on the
+        # absolute path used on the build machine.
+        bundled_chromium = resource_root() / "chrome-154"
+        adjacent_chromium = application_root() / "chrome-154"
+        for chromium_candidate in (bundled_chromium, adjacent_chromium):
+            if (chromium_candidate / "chrome.exe").is_file():
+                self.app_settings.chromium_path = str(chromium_candidate)
+                break
         root = args[0] if args else kwargs.get("root", getattr(self, "root", None))
         try:
             if root is not None:

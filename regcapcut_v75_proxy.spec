@@ -11,6 +11,7 @@ a = Analysis(
         ('modules\\actions\\capcut_workflow.py', 'modern'),
         ('REGCAPCUT_V75_VERSION.txt', '.'),
         ('modules\\browser\\chromium.py', 'modules\\browser'),
+        ('H:\\regcapcut_v7.5\\chrome-154', 'chrome-154'),
         ('H:\\regcapcut_v7.5\\_internal\\certifi\\cacert.pem', 'certifi'),
         ('H:\\regcapcut_v7.5\\_internal\\certifi\\py.typed', 'certifi'),
         ('H:\\regcapcut_v7.5\\_internal\\core\\settings.json', 'core'),

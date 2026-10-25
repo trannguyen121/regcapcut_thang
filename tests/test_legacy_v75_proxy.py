@@ -246,6 +246,17 @@ class LegacyV75RegistrationPatchTests(unittest.TestCase):
         self.assertIn("--disable-component-update", launch_args)
         self.assertIn("--disable-background-networking", launch_args)
 
+    def test_portable_build_prefers_bundled_chrome_154(self):
+        source = inspect.getsource(legacy_patch.patch_hold_proxy)
+        spec = (Path(__file__).resolve().parents[1] / "regcapcut_v75_proxy.spec").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn('resource_root() / "chrome-154"', source)
+        self.assertIn('application_root() / "chrome-154"', source)
+        self.assertIn('self.app_settings.chromium_path = str(chromium_candidate)', source)
+        self.assertIn("('H:\\\\regcapcut_v7.5\\\\chrome-154', 'chrome-154')", spec)
+
     def test_modern_workflow_is_used_only_for_reg_treo(self):
         class LegacyApp:
             def proxy_for_worker(self, _index, _max_threads):
