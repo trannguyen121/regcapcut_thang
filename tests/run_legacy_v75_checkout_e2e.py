@@ -15,9 +15,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from modules.actions.capcut_add_link import _login_with_email
-from modules.actions.capcut_workflow import _connect_browser, run_capcut_workflow
-from modules.browser.chromium import open_workflow_page
 from modules.regcapcut_cli import load_app_settings, parse_mail_api_line
 import legacy_regcapcut_v75_proxy as legacy_v75
 
@@ -30,6 +27,11 @@ def main() -> int:
     parser.add_argument("--threads", type=int, default=2)
     parser.add_argument("--pass-capcut", default="1234567")
     parser.add_argument("--output", default=".tmp/legacy_v75_checkout_e2e.json")
+    parser.add_argument(
+        "--success-output",
+        default="export/payment_success.txt",
+        help="append confirmed paid accounts after manual checkout",
+    )
     parser.add_argument("--chrome", default="H:/regcapcut_v7.5/chrome-154")
     parser.add_argument("--profile-offset", type=int, default=0)
     args = parser.parse_args()
@@ -50,14 +52,17 @@ def main() -> int:
     settings = dataclasses.replace(load_app_settings(), chromium_path=args.chrome)
     namespace = legacy_v75.prepare_legacy_app()
     app_class = namespace["RegCapCutApp"]
+    workflow = namespace["run_capcut_workflow"]
     stop_event = threading.Event()
     thread_count = min(max(1, args.threads), len(accounts))
     results = []
     lock = threading.Lock()
+    success_output = Path(args.success_output)
 
     def run_one(index, account):
         app = app_class.__new__(app_class)
         app.app_settings = settings
+        app.hold_mode = True
         account[legacy_v75._WINDOW_SLOT_KEY] = index % thread_count
         account[legacy_v75._WINDOW_TOTAL_KEY] = thread_count
         process = None
@@ -67,46 +72,22 @@ def main() -> int:
                 account, index + max(0, args.profile_offset)
             )
             context = {"start_result": start_result, "stop_event": stop_event}
-            with run_capcut_workflow.__globals__["sync_playwright"]() as playwright:
-                browser = _connect_browser(
-                    playwright,
-                    run_capcut_workflow.__globals__["_cdp_url"](context),
-                    account["user"],
-                    stop_event,
-                )
-                page = open_workflow_page(browser, context)
-                try:
-                    _login_with_email(page, account, stop_event, max_attempts=1)
-                except Exception:
-                    try:
-                        body = page.locator("body").inner_text(timeout=3000)[:1200]
-                        safe_body = body.encode("ascii", "replace").decode("ascii")
-                        print(
-                            f"[E2E][V7.5][CHECKOUT] Login diagnostic {account['user']} "
-                            f"url={page.url} body={safe_body!r}"
-                        )
-                    except Exception:
-                        pass
-                    raise
-                try:
-                    page.goto(
-                        "https://www.capcut.com/my-cloud?tab=all",
-                        wait_until="domcontentloaded",
-                        timeout=30000,
-                    )
-                except Exception:
-                    try:
-                        page.evaluate("window.stop()")
-                    except Exception:
-                        pass
-                print(f"[E2E][V7.5][CHECKOUT] Workspace {account['user']}: {page.url}")
-            legacy_v75.open_pro_checkout_across_five_tabs(
-                account,
-                context,
-                run_capcut_workflow,
+            workflow_ok = bool(workflow(account, context))
+            paid = workflow_ok and context.get("payment_confirmed") is True
+            status = "success" if paid else "payment_not_confirmed"
+            error = "" if paid else context.get(
+                "checkout_error",
+                "registration/login or checkout ended without confirmed payment",
             )
-            status = "success"
-            error = ""
+            if paid:
+                success_output.parent.mkdir(parents=True, exist_ok=True)
+                export_line = account.get("api") or (
+                    f"{account['user']}|{account.get('passnew', '')}"
+                )
+                with lock:
+                    with success_output.open("a", encoding="utf-8") as file:
+                        file.write(str(export_line).rstrip("\r\n") + "\n")
+                        file.flush()
         except Exception as exc:
             status = "error"
             error = f"{type(exc).__name__}: {exc}"
@@ -120,6 +101,12 @@ def main() -> int:
             "user": account["user"],
             "status": status,
             "elapsed_seconds": round(time.monotonic() - started, 2),
+            "payment_confirmed": context.get("payment_confirmed") is True
+            if "context" in locals()
+            else False,
+            "payment_evidence": context.get("payment_evidence", "")
+            if "context" in locals()
+            else "",
             "error": error,
         }
         with lock:
@@ -138,7 +125,10 @@ def main() -> int:
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps({"results": results}, indent=2), encoding="utf-8")
     successes = sum(item["status"] == "success" for item in results)
-    print(f"[E2E][V7.5][CHECKOUT] RESULT {successes}/{len(results)} | {output}")
+    print(
+        f"[E2E][V7.5][CHECKOUT] RESULT {successes}/{len(results)} | "
+        f"report={output} paid_accounts={success_output}"
+    )
     return 0 if successes == len(results) else 1
 
 

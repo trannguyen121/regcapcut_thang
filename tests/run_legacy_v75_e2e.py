@@ -32,6 +32,10 @@ def main() -> int:
     parser.add_argument("--output", default=".tmp/legacy_v75_e2e_result.json")
     parser.add_argument("--chrome", default="H:/regcapcut_v7.5/chrome-154")
     parser.add_argument("--force-five-tabs", action="store_true")
+    parser.add_argument("--force-primary-popup-close", action="store_true")
+    parser.add_argument("--force-primary-popup-close-during-hold", action="store_true")
+    parser.add_argument("--force-first-fallback-popup-close", action="store_true")
+    parser.add_argument("--normal-registration", action="store_true")
     args = parser.parse_args()
 
     accounts = []
@@ -64,6 +68,8 @@ def main() -> int:
         try:
             print(f"[E2E][V7.5] START {account['user']}", flush=True)
             process, start_result = app._start_standalone_chromium(account, index)
+            if args.normal_registration:
+                start_result.reg_treo = False
             launch_elapsed = time.monotonic() - started
             print(
                 f"[E2E][V7.5] CHROME {account['user']} {launch_elapsed:.2f}s",
@@ -73,17 +79,25 @@ def main() -> int:
                 "start_result": start_result,
                 "stop_event": stop_event,
                 "force_first_checkout_failure": args.force_five_tabs,
+                "force_primary_popup_close": args.force_primary_popup_close,
+                "force_primary_popup_close_during_hold": args.force_primary_popup_close_during_hold,
+                "force_first_fallback_popup_close": args.force_first_fallback_popup_close,
+                "e2e_return_on_stable_popup": True,
             }
             workflow_success = bool(workflow(account, context))
             checkout_success = context.get("checkout_success")
-            success = workflow_success and checkout_success is True
+            success = workflow_success and (
+                args.normal_registration or checkout_success is True
+            )
             status = "success" if success else "failed"
             if success:
                 error = ""
             elif not workflow_success:
                 error = "workflow returned false"
-            else:
+            elif not args.normal_registration:
                 error = context.get("checkout_error", "checkout was not verified")
+            else:
+                error = "normal registration did not complete"
         except Exception as exc:
             status = "error"
             error = f"{type(exc).__name__}: {exc}"

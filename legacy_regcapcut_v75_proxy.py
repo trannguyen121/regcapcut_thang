@@ -9,6 +9,7 @@ import marshal
 import os
 import re
 import select
+import shutil
 import socket
 import ssl
 import struct
@@ -25,10 +26,69 @@ from urllib.parse import unquote, urlsplit
 LEGACY_ENTRY_NAME = "reg_capcut_tab.pyc"
 LEGACY_PYZ_NAME = "PYZ.pyz"
 MODERN_WORKFLOW_NAME = "capcut_workflow.py"
-LEGACY_PATCH_VERSION = "7.5.200"
+LEGACY_PATCH_VERSION = "7.5.507"
 _PENDING_PROXY_KEY = "_v75_pending_proxy"
 _WINDOW_SLOT_KEY = "_v75_window_slot"
 _WINDOW_TOTAL_KEY = "_v75_window_total"
+_BROWSER_CHOICE_BUNDLED = "chrome154"
+_BROWSER_CHOICE_SYSTEM = "system"
+
+
+class PauseAwareEvent:
+    """A stop Event that cooperatively blocks workers while paused."""
+
+    def __init__(self, stop_event=None, pause_event=None):
+        self._stop_event = stop_event or threading.Event()
+        self._pause_event = pause_event or threading.Event()
+
+    def set(self):
+        # Stop must always wake a paused worker.
+        self._pause_event.clear()
+        self._stop_event.set()
+
+    def clear(self):
+        self._stop_event.clear()
+        self._pause_event.clear()
+
+    def pause(self):
+        if not self._stop_event.is_set():
+            self._pause_event.set()
+
+    def resume(self):
+        self._pause_event.clear()
+
+    def is_paused(self):
+        return self._pause_event.is_set() and not self._stop_event.is_set()
+
+    def stop_requested(self):
+        return self._stop_event.is_set()
+
+    def _wait_while_paused(self):
+        while self._pause_event.is_set() and not self._stop_event.is_set():
+            self._stop_event.wait(0.1)
+
+    def is_set(self):
+        self._wait_while_paused()
+        return self._stop_event.is_set()
+
+    def wait(self, timeout=None):
+        if self._stop_event.is_set():
+            return True
+        remaining = None if timeout is None else max(0.0, float(timeout))
+        while True:
+            if self._stop_event.is_set():
+                return True
+            if self._pause_event.is_set():
+                self._wait_while_paused()
+                continue
+            if remaining is not None and remaining <= 0:
+                return False
+            wait_slice = 0.1 if remaining is None else min(0.1, remaining)
+            started = time.monotonic()
+            if self._stop_event.wait(wait_slice):
+                return True
+            if remaining is not None:
+                remaining -= time.monotonic() - started
 
 
 _DISCOUNTED_22000_PRICE_PATTERN = re.compile(
@@ -47,6 +107,10 @@ _CHECKOUT_DUE_22000_PATTERN = re.compile(
 _CHECKOUT_FIRST_MONTH_22000_PATTERN = re.compile(
     r"(?:First[-\s]*time\s+discount|Giảm\s+giá\s+lần\s+đầu)\s*:?[\s\S]{0,40}?"
     r"(?:₫\s*22[.,\s]?000|22[.,\s]?000\s*(?:₫|đ|d|vnd))\s*/?\s*month",
+    re.I,
+)
+_CHECKOUT_URL_PATTERN = re.compile(
+    r"(?:cashier|checkout|payin|pipopay|payment)",
     re.I,
 )
 
@@ -70,6 +134,11 @@ def _checkout_due_today_is_22000(text) -> bool:
     )
 
 
+def _is_checkout_url(url) -> bool:
+    """Distinguish the payment target from unrelated pages opened by CapCut."""
+    return bool(_CHECKOUT_URL_PATTERN.search(str(url or "")))
+
+
 def application_root() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
@@ -79,6 +148,80 @@ def application_root() -> Path:
 def resource_root() -> Path:
     bundle_root = getattr(sys, "_MEIPASS", None)
     return Path(bundle_root).resolve() if bundle_root else application_root()
+
+
+def _browser_choice_path() -> Path:
+    """Store the GUI browser choice per Windows user, including portable builds."""
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    base = Path(local_app_data) if local_app_data else application_root()
+    return base / "RegCapCut" / "browser_choice.txt"
+
+
+def _read_browser_choice() -> str:
+    try:
+        value = _browser_choice_path().read_text(encoding="utf-8").strip().lower()
+    except OSError:
+        value = ""
+    return value if value in {_BROWSER_CHOICE_BUNDLED, _BROWSER_CHOICE_SYSTEM} else _BROWSER_CHOICE_BUNDLED
+
+
+def _write_browser_choice(value: str) -> None:
+    if value not in {_BROWSER_CHOICE_BUNDLED, _BROWSER_CHOICE_SYSTEM}:
+        return
+    try:
+        path = _browser_choice_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(value, encoding="utf-8")
+    except OSError as exc:
+        print(f"[BROWSER] Could not save Chrome choice: {exc}")
+
+
+def _chrome_executable(candidate) -> Path | None:
+    value = str(candidate or "").strip().strip('"')
+    if not value:
+        return None
+    path = Path(value).expanduser()
+    executable = path / "chrome.exe" if path.is_dir() else path
+    return executable.resolve() if executable.is_file() else None
+
+
+def _find_system_chrome(configured_path=None) -> Path | None:
+    """Find the normal Google Chrome installed on the current Windows host."""
+    candidates = []
+    configured = _chrome_executable(configured_path)
+    if configured is not None and "chrome-154" not in str(configured).lower():
+        candidates.append(configured)
+    path_chrome = shutil.which("chrome.exe") or shutil.which("chrome")
+    if path_chrome:
+        candidates.append(Path(path_chrome))
+    for environment_name, relative_path in (
+        ("PROGRAMFILES", "Google/Chrome/Application/chrome.exe"),
+        ("PROGRAMFILES(X86)", "Google/Chrome/Application/chrome.exe"),
+        ("LOCALAPPDATA", "Google/Chrome/Application/chrome.exe"),
+    ):
+        base = os.environ.get(environment_name)
+        if base:
+            candidates.append(Path(base) / relative_path)
+    if os.name == "nt":
+        try:
+            import winreg
+
+            for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+                try:
+                    with winreg.OpenKey(
+                        hive,
+                        r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
+                    ) as key:
+                        candidates.append(Path(winreg.QueryValue(key, None)))
+                except OSError:
+                    continue
+        except (ImportError, OSError):
+            pass
+    for candidate in candidates:
+        executable = _chrome_executable(candidate)
+        if executable is not None:
+            return executable
+    return None
 
 
 def legacy_asset(name: str) -> Path:
@@ -781,6 +924,8 @@ def open_pro_checkout_across_five_tabs(account, context, original_workflow):
         workspace_url = str(getattr(workspace_page, "url", "") or "")
         if not is_account_workspace(workspace_url):
             raise RuntimeError(f"Authenticated CapCut workspace was not found: {workspace_url}")
+        if context is not None:
+            context["payment_workspace_url"] = workspace_url
         print(f"[REG TREO][PRO] Using authenticated workspace for {user}: {workspace_url}")
 
         def visible_enabled(candidates):
@@ -798,13 +943,14 @@ def open_pro_checkout_across_five_tabs(account, context, original_workflow):
             return None
 
         def click_control(control):
+            """Click hydrated CapCut controls without spending 10s per action."""
             try:
-                control.click(timeout=5000)
+                control.click(timeout=1800)
             except Exception:
                 try:
-                    control.click(timeout=5000, force=True)
+                    control.click(timeout=1800, force=True)
                 except Exception:
-                    control.evaluate("element => element.click()", timeout=2000)
+                    control.evaluate("element => element.click()", timeout=1000)
 
         def dismiss_overlays(page):
             labels = ("Skip", "Bỏ qua", "Not now", "Maybe later", "No thanks", "Got it", "Đã hiểu")
@@ -929,13 +1075,13 @@ def open_pro_checkout_across_five_tabs(account, context, original_workflow):
                     dismissed = False
                 if dismissed:
                     print(f"[REG TREO][PRO] Dismissed blocking Get offer popup for {user}")
-                    time.sleep(0.5)
+                    time.sleep(0.3)
                     return True
                 if time.time() >= deadline:
                     return False
-                time.sleep(0.25)
+                time.sleep(0.15)
 
-        def wait_for_top_upgrade(page, timeout=60):
+        def wait_for_top_upgrade(page, timeout=10):
             deadline = time.time() + timeout
             while time.time() < deadline:
                 dismiss_overlays(page)
@@ -955,7 +1101,7 @@ def open_pro_checkout_across_five_tabs(account, context, original_workflow):
                     except Exception:
                         pass
                     return candidate
-                time.sleep(0.5)
+                time.sleep(0.15)
             return None
 
         def select_monthly_pricing(page):
@@ -991,7 +1137,7 @@ def open_pro_checkout_across_five_tabs(account, context, original_workflow):
                 except Exception:
                     continue
                 print(f"[REG TREO][PRO] Switched pricing from Yearly to Monthly for {user}")
-                time.sleep(1.5)
+                time.sleep(0.25)
                 return True
             return False
 
@@ -1026,7 +1172,7 @@ def open_pro_checkout_across_five_tabs(account, context, original_workflow):
                             click_control(learn_more)
                             promotion_opened = True
                             print(f"[REG TREO][PRO] Opened delayed pricing promotion for {user}")
-                            time.sleep(1.5)
+                            time.sleep(0.5)
                             continue
                         except Exception:
                             pass
@@ -1072,7 +1218,7 @@ def open_pro_checkout_across_five_tabs(account, context, original_workflow):
                     except Exception:
                         continue
                     print(f"[REG TREO][PRO] Selected 22,000d Monthly offer for {user}")
-                    time.sleep(0.75)
+                    time.sleep(0.25)
 
                     # The pricing card exposes a black Upgrade control.
                     # control that can be a div rather than a real button.
@@ -1210,51 +1356,265 @@ def open_pro_checkout_across_five_tabs(account, context, original_workflow):
                                 purchase = purchase_text
                     if purchase is not None:
                         return purchase
-                time.sleep(0.5)
+                time.sleep(0.25)
             return None
 
-        def reload_before_upgrade(page, location):
-            """Refresh one authenticated workspace and clear blocking overlays."""
-            page.bring_to_front()
-            print(f"[REG TREO][PRO] Reloading {location} before Upgrade for {user}")
-            try:
-                page.reload(wait_until="domcontentloaded", timeout=60000)
-            except Exception as exc:
+        def monitor_checkout_while_holding(checkout_popup, location):
+            """Wait for manual payment and return only after its result is known."""
+            if bool((context or {}).get("e2e_return_on_stable_popup")):
+                return True
+
+            payment_success_pattern = re.compile(
+                r"(?:payment|purchase|subscription|order)\s+(?:was\s+)?"
+                r"(?:successful|succeeded|completed|confirmed)|"
+                r"(?:successfully\s+(?:paid|subscribed|purchased))|"
+                r"thank\s+you\s+for\s+your\s+(?:payment|purchase)|"
+                r"thanh\s*to[aá]n\s+th[aà]nh\s+c[oô]ng|"
+                r"(?:[đd]ăng\s+k[yý]|mua)\s+th[aà]nh\s+c[oô]ng",
+                re.I,
+            )
+            payment_success_url_pattern = re.compile(
+                r"(?:payment|checkout|cashier|payin|order)[^?#]*"
+                r"(?:success|complete|result)|"
+                r"(?:success|complete)[^?#]*(?:payment|checkout|order)",
+                re.I,
+            )
+
+            def page_text(candidate):
                 try:
-                    page.evaluate("window.stop()")
+                    return candidate.locator("body").inner_text(timeout=1200)
                 except Exception:
-                    pass
-                raise RuntimeError(f"reload before Upgrade failed: {exc}") from exc
-            time.sleep(2.5)
-            dismiss_overlays(page)
-            if not is_account_workspace(page.url):
-                raise RuntimeError(f"reload left authenticated workspace: {page.url}")
-            print(f"[REG TREO][PRO] Reloaded {location}; waiting for Upgrade for {user}")
+                    return ""
+
+            def paid_plan_visible(candidate):
+                """Require explicit paid-plan state, never generic pricing copy."""
+                text = page_text(candidate)
+                normalized = text.casefold().replace("’", "'")
+                if any(
+                    marker in normalized
+                    for marker in (
+                        "pro: active",
+                        "capcut pro: active",
+                        "subscription active",
+                        "you're enjoying pro benefits",
+                    )
+                ):
+                    return True
+                if re.search(
+                    r"(?im)^\s*(?:pro|ultra|teams)\s*$\s*"
+                    r"^(?:renews?|expires?|valid\s+until|next\s+billing\s+date)\b",
+                    text,
+                ):
+                    return True
+                try:
+                    return bool(
+                        candidate.evaluate(
+                            r"""() => {
+                                const visible = (node) => {
+                                    const style = getComputedStyle(node);
+                                    const box = node.getBoundingClientRect();
+                                    return style.display !== 'none' &&
+                                        style.visibility !== 'hidden' &&
+                                        box.width > 0 && box.height > 0;
+                                };
+                                const titles = Array.from(document.querySelectorAll('body *'))
+                                    .filter((node) => visible(node) &&
+                                        /^\s*(?:Pro|Ultra|Teams)\s*$/i.test(node.textContent || ''));
+                                for (const title of titles) {
+                                    let card = title;
+                                    for (let depth = 0; depth < 8 && card; depth++, card = card.parentElement) {
+                                        const value = (card.innerText || '').trim();
+                                        const planTitles = Array.from(card.querySelectorAll('*'))
+                                            .filter((node) => visible(node) &&
+                                                /^\s*(?:Free|Pro|Ultra|Teams)\s*$/i.test(node.textContent || ''));
+                                        if (/\bCurrent\s+plan\b/i.test(value) &&
+                                            /\b(?:Pro|Ultra|Teams)\b/i.test(value) &&
+                                            planTitles.length === 1 &&
+                                            !/^\s*Free\s*$/i.test(planTitles[0].textContent || '')) return true;
+                                    }
+                                }
+                                return false;
+                            }"""
+                        )
+                    )
+                except Exception:
+                    return False
+
+            def reveal_account_plan(candidate):
+                """Open CapCut's account menu so the paid-plan label is rendered."""
+                try:
+                    current_url = str(candidate.url or "")
+                except Exception:
+                    return
+                if not re.search(r"https?://(?:[^/]+\.)?capcut\.com/", current_url, re.I):
+                    return
+                selectors = (
+                    "[aria-label*='profile' i]",
+                    "[aria-label*='account' i]",
+                    "[data-testid*='avatar' i]",
+                    "[class*='avatar']",
+                )
+                for selector in selectors:
+                    try:
+                        controls = candidate.locator(selector)
+                        for control_index in range(min(controls.count(), 4)):
+                            control = controls.nth(control_index)
+                            if control.is_visible():
+                                control.click(timeout=1200)
+                                candidate.wait_for_timeout(500)
+                                return
+                    except Exception:
+                        continue
+
+            def payment_confirmed():
+                try:
+                    live_pages = [
+                        candidate
+                        for item in browser.contexts
+                        for candidate in item.pages
+                        if not candidate.is_closed()
+                    ]
+                except Exception:
+                    live_pages = []
+                for candidate in live_pages:
+                    try:
+                        current_url = str(candidate.url or "")
+                    except Exception:
+                        current_url = ""
+                    text = page_text(candidate)
+                    if payment_success_url_pattern.search(current_url) and not re.search(
+                        r"(?:fail|failed|cancel|error|declin)", current_url, re.I
+                    ):
+                        return True, f"success URL: {current_url}"
+                    if payment_success_pattern.search(text) and not re.search(
+                        r"(?:payment|purchase|order).{0,30}(?:fail|failed|declined|cancelled)",
+                        text,
+                        re.I | re.S,
+                    ):
+                        return True, "checkout success message"
+                    # The checkout can reuse the registered CapCut tab.  An
+                    # explicit "Pro / Renews on ..." state is valid evidence
+                    # there too; it cannot be confused with a pricing card.
+                    if paid_plan_visible(candidate):
+                        return True, "active paid plan visible on CapCut account"
+                return False, ""
+
+            popup_closed = threading.Event()
+            try:
+                checkout_popup.on("close", lambda *_args: popup_closed.set())
+            except Exception:
+                pass
+            print(
+                f"[REG TREO][PRO] Checkout detected on {location} for {user}; "
+                "waiting for manual payment confirmation"
+            )
+            closed_confirmation_deadline = None
+            account_plan_revealed = False
+            while True:
+                if stop_event is not None and stop_event.is_set():
+                    raise RuntimeError(f"Stop requested for {user}")
+                try:
+                    if not browser.is_connected():
+                        return False
+                except Exception:
+                    return False
+
+                paid, evidence = payment_confirmed()
+                if paid:
+                    if context is not None:
+                        context["payment_confirmed"] = True
+                        context["payment_evidence"] = evidence
+                    print(
+                        f"[REG TREO][PAYMENT] Payment confirmed for {user}: {evidence}"
+                    )
+                    return True
+
+                try:
+                    checkout_is_closed = checkout_popup.is_closed()
+                except Exception:
+                    checkout_is_closed = True
+                if popup_closed.is_set() or checkout_is_closed:
+                    if closed_confirmation_deadline is None:
+                        closed_confirmation_deadline = time.time() + 10
+                        print(
+                            f"[REG TREO][PAYMENT] Checkout closed on {location} for {user}; "
+                            "checking the account for payment confirmation"
+                        )
+                        # CapCut only adds "Pro / Renews on ..." to the DOM
+                        # after the avatar menu is opened. Reveal it once, then
+                        # let the normal confirmation loop verify the text.
+                        if not account_plan_revealed:
+                            try:
+                                account_pages = [
+                                    candidate
+                                    for item in browser.contexts
+                                    for candidate in item.pages
+                                    if not candidate.is_closed()
+                                ]
+                            except Exception:
+                                account_pages = []
+                            for candidate in account_pages:
+                                reveal_account_plan(candidate)
+                            account_plan_revealed = True
+                    elif time.time() >= closed_confirmation_deadline:
+                        if context is not None:
+                            context["checkout_tab_closed"] = True
+                            context["payment_confirmed"] = False
+                        print(
+                            f"[REG TREO][PAYMENT] Checkout closed without confirmed payment "
+                            f"for {user}"
+                        )
+                        return False
+                try:
+                    live_pages = [
+                        candidate
+                        for item in browser.contexts
+                        for candidate in item.pages
+                        if not candidate.is_closed()
+                    ]
+                except Exception:
+                    live_pages = []
+                # This is intentionally passive. A short Playwright wait merely
+                # pumps CDP events so the close event is received quickly.
+                passive_page = next(
+                    (candidate for candidate in live_pages if not candidate.is_closed()),
+                    None,
+                )
+                try:
+                    if passive_page is not None:
+                        passive_page.wait_for_timeout(500)
+                    else:
+                        time.sleep(0.5)
+                except Exception:
+                    time.sleep(0.5)
 
         def attempt_checkout(
             page,
             location,
-            reload_before=True,
-            stop_when_popup_opens=False,
             progress=None,
+            top_timeout=10,
+            plan_timeout=6,
         ):
             """Click only the verified offer and require a stable checkout."""
             progress = progress if progress is not None else {}
             progress["top_upgrade_clicked"] = False
             progress["plan_action_clicked"] = False
-            if reload_before:
-                reload_before_upgrade(page, location)
-            else:
-                page.bring_to_front()
+            page.bring_to_front()
+            dismiss_overlays(page)
             print(f"[REG TREO][PRO] Waiting for top Upgrade on {location} for {user}")
-            top_upgrade = wait_for_top_upgrade(page)
+            top_upgrade = wait_for_top_upgrade(page, timeout=top_timeout)
             if top_upgrade is None:
-                raise RuntimeError("top Upgrade did not appear within 60 seconds")
+                raise RuntimeError(
+                    f"top Upgrade did not appear within {top_timeout:g} seconds"
+                )
             click_control(top_upgrade)
             progress["top_upgrade_clicked"] = True
             print(f"[REG TREO][PRO] Clicked top Upgrade on {location} for {user}")
-            time.sleep(1.5)
-            dismiss_discount_offer_popup(page, timeout=6)
+            time.sleep(0.2)
+            # Probe briefly here. If the campaign overlay is injected later,
+            # find_pro_button() keeps dismissing it on every fast polling pass,
+            # so an absent overlay no longer adds four seconds to every tab.
+            dismiss_discount_offer_popup(page, timeout=1.2)
 
             # Some accounts first receive a compact CapCut Pro promotion
             # instead of the pricing sheet. Open its Learn more action before
@@ -1266,11 +1626,14 @@ def open_pro_checkout_across_five_tabs(account, context, original_workflow):
             if learn_more.count() and learn_more.first.is_visible():
                 click_control(learn_more.first)
                 print(f"[REG TREO][PRO] Opened pricing from Learn more on {location} for {user}")
-                time.sleep(1.5)
+                time.sleep(0.25)
 
-            pro_button = find_pro_button(page, timeout=10)
+            pro_button = find_pro_button(page, timeout=plan_timeout)
             if pro_button is None:
-                raise RuntimeError("22,000 VND monthly Pro action did not appear within 10 seconds")
+                raise RuntimeError(
+                    f"22,000 VND monthly Pro action did not appear within "
+                    f"{plan_timeout:g} seconds"
+                )
 
             pages_before = [candidate for item in browser.contexts for candidate in item.pages]
             event_offset = len(opened_pages)
@@ -1280,24 +1643,86 @@ def open_pro_checkout_across_five_tabs(account, context, original_workflow):
 
             checkout_popup = None
             learn_more_handled = False
+            popup_closed_during_attempt = False
+            checkout_target_seen = False
+            attempt_pages = []
+            close_events = {}
+
+            def remember_attempt_page(candidate):
+                nonlocal checkout_target_seen
+                if candidate in attempt_pages:
+                    return
+                attempt_pages.append(candidate)
+                closed_event = threading.Event()
+                close_events[candidate] = closed_event
+                try:
+                    candidate.on("close", lambda *_args, event=closed_event: event.set())
+                except Exception:
+                    pass
+                try:
+                    checkout_target_seen = checkout_target_seen or _is_checkout_url(candidate.url)
+                except Exception:
+                    pass
+
             deadline = time.time() + 5
             while time.time() < deadline:
-                checkout_popup = next(
-                    (
-                        candidate
-                        for candidate in opened_pages[event_offset:]
-                        if candidate not in pages_before
-                    ),
-                    None,
-                )
-                if checkout_popup is None:
-                    current_pages = [candidate for item in browser.contexts for candidate in item.pages]
-                    checkout_popup = next(
-                        (candidate for candidate in current_pages if candidate not in pages_before),
-                        None,
-                    )
+                current_pages = [candidate for item in browser.contexts for candidate in item.pages]
+                for candidate in list(opened_pages[event_offset:]) + current_pages:
+                    if candidate not in pages_before:
+                        remember_attempt_page(candidate)
+
+                live_attempt_pages = []
+                checkout_attempt_pages = []
+                for candidate in attempt_pages:
+                    try:
+                        if close_events[candidate].is_set() or candidate.is_closed():
+                            continue
+                        live_attempt_pages.append(candidate)
+                        if _is_checkout_url(candidate.url):
+                            checkout_target_seen = True
+                            checkout_attempt_pages.append(candidate)
+                    except Exception:
+                        close_events[candidate].set()
+
+                # A plan click can briefly create an unrelated target before
+                # the actual PipoPay cashier. Prefer the confirmed checkout URL
+                # so hold mode never watches the wrong page.
+                checkout_popup = checkout_attempt_pages[-1] if checkout_attempt_pages else None
                 if checkout_popup is not None:
-                    break
+                    # CapCut can create the checkout window and close it again
+                    # immediately. Do not treat that transient page event as a
+                    # successful popup, otherwise the workflow enters hold
+                    # mode on the pricing sheet and never opens fallback tabs.
+                    force_close_key = None
+                    if (
+                        str(location).startswith("registered tab")
+                        and bool((context or {}).get("force_primary_popup_close"))
+                        and not bool((context or {}).get("_forced_primary_popup_closed"))
+                    ):
+                        force_close_key = "_forced_primary_popup_closed"
+                    elif (
+                        str(location).startswith("fallback tab")
+                        and bool((context or {}).get("force_first_fallback_popup_close"))
+                        and not bool((context or {}).get("_forced_fallback_popup_closed"))
+                    ):
+                        force_close_key = "_forced_fallback_popup_closed"
+                    if force_close_key is not None:
+                        try:
+                            checkout_popup.close()
+                        finally:
+                            context[force_close_key] = True
+                        print(
+                            f"[REG TREO][PRO] Forced checkout popup close for E2E "
+                            f"on {location} for {user}"
+                        )
+                    else:
+                        print(
+                            f"[REG TREO][PRO] Checkout popup opened from {location} "
+                            f"for {user}; stopping all reload/click activity"
+                        )
+                        if monitor_checkout_while_holding(checkout_popup, location):
+                            return True
+                        raise RuntimeError("checkout closed without confirmed payment")
                 if not learn_more_handled:
                     learn_more = page.get_by_role(
                         "button", name=re.compile(r"^\s*Learn more\s*$", re.I)
@@ -1305,111 +1730,77 @@ def open_pro_checkout_across_five_tabs(account, context, original_workflow):
                     if learn_more.count() and learn_more.first.is_visible():
                         click_control(learn_more.first)
                         learn_more_handled = True
-                        time.sleep(0.75)
-                        pro_button = find_pro_button(page, timeout=10)
+                        time.sleep(0.25)
+                        pro_button = find_pro_button(page, timeout=plan_timeout)
                         if pro_button is not None:
                             click_control(pro_button)
-                time.sleep(0.5)
+                time.sleep(0.15)
 
-            if checkout_popup is None:
-                raise RuntimeError("checkout popup did not open within 5 seconds")
-
-            # The registered tab is always the primary attempt. Once its exact
-            # 22,000 VND Upgrade/Purchase action opens checkout, leave that
-            # popup untouched and stop the automation immediately. In
-            # particular, do not let slow checkout rendering or a later popup
-            # close trigger creation of the five fallback tabs.
-            if stop_when_popup_opens:
+            live_attempt_pages = []
+            checkout_attempt_pages = []
+            for candidate in attempt_pages:
+                try:
+                    if close_events[candidate].is_set() or candidate.is_closed():
+                        continue
+                    live_attempt_pages.append(candidate)
+                    if _is_checkout_url(candidate.url):
+                        checkout_target_seen = True
+                        checkout_attempt_pages.append(candidate)
+                except Exception:
+                    close_events[candidate].set()
+            any_attempt_page_closed = any(event.is_set() for event in close_events.values())
+            if not checkout_attempt_pages:
+                popup_closed_during_attempt = checkout_target_seen or any_attempt_page_closed
+                checkout_popup = None
+            else:
+                checkout_popup = checkout_attempt_pages[-1]
+            if popup_closed_during_attempt:
                 print(
-                    f"[REG TREO][PRO] Checkout popup opened from {location} "
-                    f"for {user}; skipping all 5 fallback tabs"
+                    f"[REG TREO][PRO] Checkout target disappeared within 5 seconds "
+                    f"on {location} for {user}; continuing to fallback"
                 )
-                return
 
-            verified_checkout = False
-            checkout_text = ""
-            amount_deadline = time.time() + 30
-            while time.time() < amount_deadline:
-                if checkout_popup.is_closed():
-                    raise RuntimeError("checkout popup closed before price verification")
-                try:
-                    checkout_text = checkout_popup.locator("body").inner_text(timeout=2000)
-                except Exception:
-                    checkout_text = ""
-                if _checkout_due_today_is_22000(checkout_text):
-                    verified_checkout = True
-                    break
-                time.sleep(0.5)
-            if not verified_checkout:
-                try:
-                    checkout_popup.close()
-                except Exception:
-                    pass
-                compact_checkout = re.sub(r"\s+", " ", checkout_text).strip()[:240]
-                checkout_url = str(getattr(checkout_popup, "url", "") or "")
-                raise RuntimeError(
-                    "checkout Due today is not 22,000 VND; rejected popup: "
-                    f"url={checkout_url} | {compact_checkout}"
-                )
+            if popup_closed_during_attempt:
+                raise RuntimeError("checkout popup opened but closed within 5 seconds")
+            if checkout_popup is None or checkout_popup.is_closed():
+                raise RuntimeError("checkout popup did not open within 5 seconds")
             print(
-                f"[REG TREO][PRO] Verified checkout Due today 22,000d "
-                f"from {location} for {user}"
+                f"[REG TREO][PRO] Checkout popup opened from {location} for {user}; "
+                "stopping all reload/click activity"
             )
+            if monitor_checkout_while_holding(checkout_popup, location):
+                return True
+            raise RuntimeError("checkout closed without confirmed payment")
 
-            stability_deadline = time.time() + 8
-            while time.time() < stability_deadline:
-                if checkout_popup.is_closed():
-                    raise RuntimeError("checkout popup closed unexpectedly")
-                time.sleep(0.5)
-            print(
-                f"[REG TREO][PRO] Checkout popup stable from {location} "
-                f"for {user}; entering hold mode"
-            )
-
-        # Always use the just-registered incognito tab first. Scan the pricing
-        # sheet for only 10 seconds per reload and try the registered tab twice.
-        # If the exact offer still does not appear, continue with the five
-        # sibling tabs; never click a different price just to make progress.
+        # Always inspect the just-registered incognito tab first, without
+        # refreshing it. If the exact offer is already visible, click it
+        # immediately. Otherwise continue with five freshly opened sibling
+        # tabs. Failed fallback tabs receive one staggered reload round.
         force_first_failure = bool((context or {}).get("force_first_checkout_failure"))
         if force_first_failure:
             print(f"[REG TREO][PRO] Forced first checkout failure for E2E: {user}")
         else:
-            for primary_attempt in range(1, 3):
-                primary_progress = {}
-                try:
-                    attempt_checkout(
-                        workspace_page,
-                        f"registered tab attempt {primary_attempt}/2",
-                        stop_when_popup_opens=True,
-                        progress=primary_progress,
-                    )
-                    return
-                except Exception as exc:
-                    safe_error = str(exc).encode("ascii", "replace").decode("ascii")
-                    if primary_progress.get("plan_action_clicked"):
-                        print(
-                            f"[REG TREO][PRO] Registered tab clicked 22,000d Upgrade "
-                            f"but no checkout popup appeared for {user}: {safe_error}; "
-                            f"opening 5 incognito fallback tabs"
-                        )
-                        break
+            primary_progress = {}
+            try:
+                return attempt_checkout(
+                    workspace_page,
+                    "registered tab",
+                    progress=primary_progress,
+                )
+            except Exception as exc:
+                safe_error = str(exc).encode("ascii", "replace").decode("ascii")
+                if primary_progress.get("plan_action_clicked"):
                     print(
-                        f"[REG TREO][PRO] Registered tab has not clicked 22,000d "
-                        f"Upgrade for {user} (attempt {primary_attempt}/2): {safe_error}"
+                        f"[REG TREO][PRO] Registered tab clicked 22,000d Upgrade "
+                        f"but no checkout popup appeared for {user}: {safe_error}; "
+                        f"opening 5 incognito fallback tabs without reloading"
                     )
-                    if primary_attempt < 2:
-                        print(
-                            f"[REG TREO][PRO] Retrying the registered tab before "
-                            f"any fallback tab is allowed for {user}"
-                        )
-                        time.sleep(1)
-                        continue
+                else:
                     print(
-                        f"[REG TREO][PRO] Exact 22,000d offer was not found on "
-                        f"the registered tab after 2 reloads for {user}; "
-                        f"opening 5 incognito fallback tabs"
+                        f"[REG TREO][PRO] Exact 22,000d offer was not available on "
+                        f"the registered tab for {user}: {safe_error}; opening 5 "
+                        "incognito fallback tabs without reloading"
                     )
-                    break
 
         def open_adjacent_tab_from_workspace(tab_number):
             """Open a real sibling tab from the registered tab, never a new window."""
@@ -1435,10 +1826,10 @@ def open_pro_checkout_across_five_tabs(account, context, original_workflow):
                 # A trusted click on target=_blank makes Chrome insert a normal
                 # tab beside its opener. BrowserContext.new_page() is avoided
                 # because CDP can represent that target as a separate window.
-                with browser_context.expect_page(timeout=15000) as page_info:
+                with browser_context.expect_page(timeout=10000) as page_info:
                     workspace_page.locator(f"#{link_id}").click(
                         force=True,
-                        timeout=5000,
+                        timeout=3000,
                     )
                 adjacent_page = page_info.value
             finally:
@@ -1451,127 +1842,901 @@ def open_pro_checkout_across_five_tabs(account, context, original_workflow):
                     pass
             return adjacent_page
 
-        # Keep the registration/workspace page and open five additional tabs of
-        # that exact signed-in space. Load them sequentially with a short gap;
-        # opening five navigations at once can trigger CapCut's Access Denied page.
+        # Keep the registration/workspace page and create all five sibling tabs
+        # first. Start their navigations together instead of waiting for each
+        # page to finish before opening the next one.
         candidate_tabs = []
         for tab_number in range(1, 6):
             page = open_adjacent_tab_from_workspace(tab_number)
-            navigation_error = None
-            for navigation_attempt in range(1, 3):
-                try:
-                    page.goto(workspace_url, wait_until="domcontentloaded", timeout=30000)
-                    if is_account_workspace(page.url):
-                        navigation_error = None
-                        break
-                    navigation_error = RuntimeError(f"redirected outside workspace: {page.url}")
-                except Exception as exc:
-                    navigation_error = exc
-                if navigation_attempt < 2:
-                    time.sleep(2)
-            if navigation_error is not None:
-                safe_error = str(navigation_error).encode("ascii", "replace").decode("ascii")
-                print(f"[REG TREO][PRO] Tab {tab_number}/5 navigation warning for {user}: {safe_error}")
-            candidate_tabs.append((page, navigation_error))
+            candidate_tabs.append((page, None))
             print(f"[REG TREO][PRO] Opened adjacent workspace tab {tab_number}/5 for {user}")
-            time.sleep(1.2)
+            if tab_number < 5:
+                time.sleep(1.0)
+
+        print(f"[REG TREO][PRO] Starting all 5 fallback tab navigations for {user}")
+        navigation_errors = {}
+        navigation_sessions = {}
+        for tab_number, (page, _navigation_error) in enumerate(candidate_tabs, start=1):
+            try:
+                # Dispatch browser-level navigations back-to-back. This keeps
+                # all five tabs moving together and is not a page reload.
+                cdp_session = browser_context.new_cdp_session(page)
+                navigation_sessions[tab_number] = cdp_session
+                result = cdp_session.send("Page.navigate", {"url": workspace_url})
+                if result.get("errorText"):
+                    raise RuntimeError(result["errorText"])
+            except Exception as exc:
+                navigation_errors[tab_number] = exc
+
+        pending_tabs = set(range(1, 6))
+        shared_navigation_deadline = time.time() + 20
+        while pending_tabs and time.time() < shared_navigation_deadline:
+            for tab_number in list(pending_tabs):
+                page = candidate_tabs[tab_number - 1][0]
+                try:
+                    if page.is_closed():
+                        navigation_errors[tab_number] = RuntimeError("tab closed during navigation")
+                        pending_tabs.remove(tab_number)
+                    elif is_account_workspace(page.url):
+                        pending_tabs.remove(tab_number)
+                except Exception as exc:
+                    navigation_errors[tab_number] = exc
+                    pending_tabs.remove(tab_number)
+            if pending_tabs:
+                time.sleep(0.15)
+        for tab_number in pending_tabs:
+            page = candidate_tabs[tab_number - 1][0]
+            navigation_errors[tab_number] = RuntimeError(
+                f"shared navigation timeout after 20 seconds; url={getattr(page, 'url', '')}"
+            )
+        for cdp_session in navigation_sessions.values():
+            try:
+                cdp_session.detach()
+            except Exception:
+                pass
+        candidate_tabs = [
+            (page, navigation_errors.get(tab_number))
+            for tab_number, (page, _navigation_error) in enumerate(candidate_tabs, start=1)
+        ]
+        print(
+            f"[REG TREO][PRO] All 5 fallback navigations dispatched for {user}; "
+            f"ready={5 - len(navigation_errors)}/5"
+        )
 
         failures = []
-        for reload_round in range(1, 3):
-            print(
-                f"[REG TREO][PRO] Reloading all 5 fallback tabs "
-                f"round {reload_round}/2 for {user}"
-            )
-            reload_results = []
-            # Finish refreshing every tab before clicking Upgrade on any tab.
-            for tab_number, (page, _navigation_error) in enumerate(candidate_tabs, start=1):
-                location = f"fallback tab {tab_number}/5 round {reload_round}/2"
+        retry_tabs = []
+        print(f"[REG TREO][PRO] Fast first scan across 5 fallback tabs: {user}")
+        for tab_number, (page, _navigation_error) in enumerate(candidate_tabs, start=1):
+            location = f"fallback tab {tab_number}/5"
+            try:
+                if tab_number in navigation_errors:
+                    raise navigation_errors[tab_number]
+                return attempt_checkout(
+                    page,
+                    location,
+                    top_timeout=5,
+                    plan_timeout=4,
+                )
+            except Exception as exc:
+                safe_error = str(exc).encode("ascii", "replace").decode("ascii")
+                failures.append(f"tab {tab_number} first scan: {safe_error}")
                 try:
-                    reload_before_upgrade(page, location)
-                    reload_results.append((page, None))
-                except Exception as exc:
-                    reload_results.append((page, exc))
+                    if not page.is_closed():
+                        retry_tabs.append((tab_number, page))
+                except Exception:
+                    pass
+                print(
+                    f"[REG TREO][PRO] Fast scan missed offer on fallback tab "
+                    f"{tab_number}/5 for {user}: {safe_error}"
+                )
 
-            for tab_number, (page, reload_error) in enumerate(reload_results, start=1):
-                location = f"fallback tab {tab_number}/5 round {reload_round}/2"
+        # CapCut does not expose the discounted offer on every response. Give
+        # each surviving fallback tab exactly one fresh request. Reloads are
+        # staggered to avoid a five-request burst, while CDP dispatch keeps
+        # earlier tabs loading in parallel with the later ones.
+        if retry_tabs:
+            print(
+                f"[REG TREO][PRO] Staggered reload for {len(retry_tabs)}/5 "
+                f"fallback tabs (0.7s apart): {user}"
+            )
+            reload_sessions = {}
+            reload_errors = {}
+            for retry_index, (tab_number, page) in enumerate(retry_tabs):
+                if stop_event is not None and stop_event.is_set():
+                    raise RuntimeError(f"Stop requested for {user}")
                 try:
-                    if reload_error is not None:
-                        raise RuntimeError(f"workspace reload failed: {reload_error}")
-                    attempt_checkout(page, location, reload_before=False)
-                    return
+                    session = browser_context.new_cdp_session(page)
+                    reload_sessions[tab_number] = session
+                    if is_account_workspace(getattr(page, "url", "")):
+                        result = session.send("Page.reload", {"ignoreCache": True})
+                    else:
+                        result = session.send("Page.navigate", {"url": workspace_url})
+                    if result and result.get("errorText"):
+                        raise RuntimeError(result["errorText"])
+                    print(
+                        f"[REG TREO][PRO] Reload dispatched for fallback tab "
+                        f"{tab_number}/5: {user}"
+                    )
+                except Exception as exc:
+                    reload_errors[tab_number] = exc
+                if retry_index < len(retry_tabs) - 1:
+                    if stop_event is not None and callable(getattr(stop_event, "wait", None)):
+                        if stop_event.wait(0.7):
+                            raise RuntimeError(f"Stop requested for {user}")
+                    else:
+                        time.sleep(0.7)
+
+            # The first tab has already loaded for several seconds while the
+            # last reload is dispatched. A single shared settle delay is much
+            # faster than waiting for each tab sequentially.
+            if stop_event is not None and callable(getattr(stop_event, "wait", None)):
+                if stop_event.wait(2.0):
+                    raise RuntimeError(f"Stop requested for {user}")
+            else:
+                time.sleep(2.0)
+            for session in reload_sessions.values():
+                try:
+                    session.detach()
+                except Exception:
+                    pass
+
+            print(f"[REG TREO][PRO] Scanning reloaded fallback tabs: {user}")
+            for tab_number, page in retry_tabs:
+                location = f"reloaded fallback tab {tab_number}/5"
+                try:
+                    if tab_number in reload_errors:
+                        raise reload_errors[tab_number]
+                    return attempt_checkout(
+                        page,
+                        location,
+                        top_timeout=8,
+                        plan_timeout=6,
+                    )
                 except Exception as exc:
                     safe_error = str(exc).encode("ascii", "replace").decode("ascii")
-                    failures.append(f"round {reload_round} tab {tab_number}: {safe_error}")
+                    failures.append(f"tab {tab_number} after reload: {safe_error}")
                     print(
-                        f"[REG TREO][PRO] Round {reload_round}/2 tab {tab_number}/5 "
-                        f"did not produce a stable popup for {user}: {safe_error}"
+                        f"[REG TREO][PRO] Reloaded fallback tab {tab_number}/5 "
+                        f"did not produce checkout for {user}: {safe_error}"
                     )
-                    if tab_number < len(reload_results):
-                        # This tab may have crashed or closed. Sleep outside
-                        # Playwright so one dead page cannot abort the rest of
-                        # the five-tab scan.
-                        time.sleep(1)
 
         raise RuntimeError(
-            "All 5 Upgrade tabs failed after 2 reload rounds: " + " | ".join(failures)
+            "All 5 Upgrade tabs failed after one staggered reload: "
+            + " | ".join(failures)
         )
 
 
+def cancel_capcut_subscription(account, context, original_workflow):
+    """Turn off auto-renewal in the already authenticated CapCut session."""
+    workflow_globals = original_workflow.__globals__
+    sync_playwright = workflow_globals["sync_playwright"]
+    connect_browser = workflow_globals["_connect_browser"]
+    cdp_url = workflow_globals["_cdp_url"](context)
+    stop_event = (context or {}).get("stop_event")
+    user = account["user"]
+
+    manage_pattern = re.compile(
+        r"manage\s+(?:auto[- ]?renewal|subscription)|"
+        r"qu[aả]n\s+l[yý]\s+t[uù]y\s+ch[oọ]n\s+t[uự]\s+đ[oộ]ng\s+gia\s+h[aạ]n",
+        re.I,
+    )
+    cancel_pattern = re.compile(
+        r"cancel\s+(?:the\s+)?(?:subscription|plan)|"
+        r"turn\s+off\s+auto[- ]?renewal|"
+        r"h[uủỷy]\s+g[oó]i\s+(?:đ[aă]ng\s+k[yý]|thu[eê])|"
+        r"t[aắ]t\s+(?:t[uự]\s+đ[oộ]ng\s+)?gia\s+h[aạ]n",
+        re.I,
+    )
+    confirm_pattern = re.compile(
+        r"confirm(?:\s+cancellation)?|continue\s+(?:to\s+)?cancel|"
+        r"cancel\s+(?:anyway|subscription|plan|auto[- ]?renewal)|yes,?\s+cancel|"
+        r"x[aá]c\s+nh[aậ]n\s+h[uủỷy]|ti[eế]p\s+t[uụ]c\s+h[uủỷy]|"
+        r"v[aẫ]n\s+(?:mu[oố]n\s+)?h[uủỷy]|h[uủỷy]\s+g[oó]i",
+        re.I,
+    )
+    cancelled_pattern = re.compile(
+        r"auto[- ]?renewal\s+(?:is\s+|has\s+been\s+)?(?:off|cancelled|canceled)|"
+        r"subscription\s+(?:is\s+|has\s+been\s+)?(?:cancelled|canceled)|"
+        r"cancellation\s+(?:was\s+)?successful|will\s+not\s+renew|"
+        r"^\s*(?:pro|ultra|teams)\s*$\s*^\s*expires?\s+on\b|"
+        r"đ[aã]\s+h[uủỷy](?:\s+g[oó]i|\s+gia\s+h[aạ]n)?|"
+        r"kh[oô]ng\s+(?:t[uự]\s+đ[oộ]ng\s+)?gia\s+h[aạ]n|"
+        r"h[eế]t\s+h[aạ]n\s+(?:v[aà]o|ng[aà]y)",
+        re.I | re.M,
+    )
+    resume_pattern = re.compile(
+        r"resume\s+(?:subscription|plan)|renew\s+(?:subscription|plan)|"
+        r"b[aậ]t\s+(?:l[aạ]i\s+)?gia\s+h[aạ]n|gia\s+h[aạ]n\s+l[aạ]i",
+        re.I,
+    )
+
+    def body_text(page):
+        try:
+            return str(page.locator("body").inner_text(timeout=2000) or "")
+        except Exception:
+            return ""
+
+    def click_first(locator, timeout=2500):
+        try:
+            count = min(locator.count(), 30)
+        except Exception:
+            return False
+        for index in range(count):
+            candidate = locator.nth(index)
+            try:
+                if not candidate.is_visible() or not candidate.is_enabled():
+                    continue
+                try:
+                    candidate.click(timeout=timeout)
+                except Exception:
+                    candidate.click(timeout=timeout, force=True)
+                return True
+            except Exception:
+                continue
+        return False
+
+    def click_matching_control(page, pattern, timeout=2500):
+        """Click a visible control by its rendered text across CapCut variants."""
+        controls = page.locator("button, [role='button'], a")
+        try:
+            count = min(controls.count(), 200)
+        except Exception:
+            count = 0
+        for index in range(count):
+            candidate = controls.nth(index)
+            try:
+                label = str(candidate.inner_text(timeout=500) or "").strip()
+                if not pattern.search(label):
+                    continue
+                if not candidate.is_visible() or not candidate.is_enabled():
+                    continue
+                try:
+                    candidate.click(timeout=timeout)
+                except Exception:
+                    candidate.click(timeout=timeout, force=True)
+                return True
+            except Exception:
+                continue
+        return click_first(page.get_by_text(pattern, exact=True), timeout=timeout)
+
+    def click_exact_dom_text(page, labels):
+        """DOM fallback for icon-styled controls lacking button semantics."""
+        for label in labels:
+            locators = (
+                page.get_by_text(str(label), exact=True),
+                page.locator(f"text={label}"),
+                page.locator(
+                    "xpath=//*[normalize-space(.)="
+                    + repr(str(label))
+                    + "]"
+                ),
+            )
+            for locator in locators:
+                if click_first(locator, timeout=1800):
+                    return True
+                try:
+                    count = locator.count()
+                    for index in range(count - 1, -1, -1):
+                        candidate = locator.nth(index)
+                        if not candidate.is_visible():
+                            continue
+                        candidate.click(timeout=1800, force=True)
+                        return True
+                except Exception:
+                    continue
+        try:
+            return bool(
+                page.evaluate(
+                    r"""labels => {
+                        const normalize = value => value.replace(/\s+/g, ' ').trim().toLocaleLowerCase();
+                        const wanted = labels.map(normalize);
+                        const visible = element => {
+                            const style = getComputedStyle(element);
+                            const box = element.getBoundingClientRect();
+                            return style.display !== 'none' && style.visibility !== 'hidden' &&
+                                box.width > 0 && box.height > 0;
+                        };
+                        const nodes = Array.from(document.querySelectorAll('body *'));
+                        const node = nodes.find(element => {
+                            const text = normalize(element.innerText || element.textContent || '');
+                            return wanted.includes(text) && visible(element) &&
+                                !Array.from(element.children).some(child =>
+                                    wanted.includes(normalize(child.innerText || child.textContent || ''))
+                                );
+                        });
+                        if (!node) return false;
+                        const target = node.closest('button, [role="button"], a') || node;
+                        target.click();
+                        return true;
+                    }""",
+                    list(labels),
+                )
+            )
+        except Exception:
+            return False
+
+    def cancellation_visible(page):
+        text = body_text(page)
+        if cancelled_pattern.search(text):
+            return True, "subscription manager shows auto-renewal disabled"
+        controls = page.get_by_role("button", name=resume_pattern).or_(
+            page.get_by_text(resume_pattern, exact=False)
+        )
+        try:
+            if any(controls.nth(index).is_visible() for index in range(min(controls.count(), 20))):
+                return True, "subscription manager offers renewal/resume"
+        except Exception:
+            pass
+        return False, ""
+
+    def open_profile_menu(page):
+        text = body_text(page)
+        if manage_pattern.search(text) or re.search(r"(?im)^\s*(?:pro|ultra|teams)\s*$\s*^\s*(?:renews?|expires?)\s+on\b", text):
+            return True
+        selectors = (
+            "[aria-label*='profile' i]",
+            "[aria-label*='account' i]",
+            "[data-testid*='avatar' i]",
+            "[class*='avatar']",
+        )
+        for selector in selectors:
+            if click_first(page.locator(selector), timeout=1500):
+                page.wait_for_timeout(700)
+                if re.search(r"(?im)^\s*(?:pro|ultra|teams)\s*$", body_text(page)):
+                    return True
+        # Current CapCut builds render the top-right account avatar as an
+        # icon-only canvas control without an accessible name or stable class.
+        # Probe only the far-right header area and verify the account menu;
+        # the older width-55/y75 point hits the Space settings gear on the
+        # current layout.
+        try:
+            viewport = page.evaluate("() => ({width: innerWidth, height: innerHeight})")
+            width = int(viewport["width"])
+            avatar_points = (
+                (max(1, width - 24), 20),
+                (max(1, width - 24), 48),
+                (max(1, width - 24), 75),
+                (max(1, width - 55), 20),
+            )
+            for avatar_x, avatar_y in avatar_points:
+                page.mouse.click(avatar_x, avatar_y)
+                page.wait_for_timeout(700)
+                menu_text = body_text(page)
+                menu_lowered = menu_text.casefold()
+                if (
+                    re.search(r"(?im)^\s*(?:pro|ultra|teams)\s*$", menu_text)
+                    or ("view profile" in menu_lowered and "sign out" in menu_lowered)
+                ):
+                    print(
+                        f"[REG TREO][CANCEL] Account menu opened at "
+                        f"({avatar_x}, {avatar_y}) for {user}"
+                    )
+                    return True
+                if "space settings" in menu_lowered:
+                    try:
+                        page.keyboard.press("Escape")
+                        page.wait_for_timeout(300)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return bool(re.search(r"(?im)^\s*(?:pro|ultra|teams)\s*$", body_text(page)))
+
+    def open_plan_manager(page):
+        if manage_pattern.search(body_text(page)):
+            return True
+        open_profile_menu(page)
+        titles = page.get_by_text(
+            re.compile(r"^\s*(?:Pro|Ultra|Teams)\s*$", re.I), exact=True
+        )
+        try:
+            count = min(titles.count(), 30)
+        except Exception:
+            count = 0
+        for index in range(count):
+            title = titles.nth(index)
+            try:
+                if not title.is_visible():
+                    continue
+                target = title
+                container = title.locator("xpath=ancestor::div[1]")
+                for _ in range(7):
+                    candidate_text = str(container.inner_text(timeout=400) or "")
+                    if re.search(r"renews?|expires?|gia\s+h[aạ]n|h[eế]t\s+h[aạ]n", candidate_text, re.I):
+                        target = container
+                        break
+                    container = container.locator("xpath=..")
+                try:
+                    target.click(timeout=2000)
+                except Exception:
+                    target.click(timeout=2000, force=True)
+                deadline = time.time() + 6
+                while time.time() < deadline:
+                    if manage_pattern.search(body_text(page)):
+                        return True
+                    page.wait_for_timeout(250)
+            except Exception:
+                continue
+        return manage_pattern.search(body_text(page)) is not None
+
+    with sync_playwright() as playwright:
+        browser = connect_browser(playwright, cdp_url, user, stop_event)
+        pages = [
+            candidate
+            for browser_context in browser.contexts
+            for candidate in browser_context.pages
+            if not candidate.is_closed()
+        ]
+        page = next(
+            (
+                candidate
+                for candidate in pages
+                if re.search(r"https?://(?:[^/]+\.)?capcut\.com/", str(candidate.url or ""), re.I)
+            ),
+            pages[0] if pages else None,
+        )
+        if page is None:
+            raise RuntimeError("No live CapCut page remained after payment")
+        page.bring_to_front()
+        # CapCut updates the paid-plan entitlement asynchronously after the
+        # checkout closes. Give the backend/UI five seconds before refreshing
+        # the authenticated workspace and looking for the plan manager.
+        print(
+            f"[REG TREO][CANCEL] Payment confirmed; waiting 5 seconds for "
+            f"the Pro entitlement to update: {user}"
+        )
+        page.wait_for_timeout(5000)
+        workspace_url = str((context or {}).get("payment_workspace_url") or "").strip()
+        if workspace_url:
+            try:
+                # Payment is often completed from a fallback tab that still
+                # has the pricing sheet open. Re-enter the known authenticated
+                # workspace so the account menu can be opened reliably.
+                page.goto(workspace_url, wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_timeout(2000)
+                print(f"[REG TREO][CANCEL] Reopened clean workspace for {user}")
+            except Exception as exc:
+                print(f"[REG TREO][CANCEL] Workspace reopen warning for {user}: {exc}")
+        else:
+            page.wait_for_timeout(500)
+
+        # Reload and inspect up to three times. A successful payment can take
+        # several seconds to expose both the Pro label and the cancellation
+        # entry in the account menu. Keep checks two seconds apart.
+        plan_manager_opened = False
+        refresh_errors = []
+        for refresh_attempt in range(1, 4):
+            try:
+                print(
+                    f"[REG TREO][CANCEL] Reloading paid workspace "
+                    f"({refresh_attempt}/3): {user}"
+                )
+                page.reload(wait_until="domcontentloaded", timeout=30000)
+            except Exception as exc:
+                refresh_errors.append(str(exc))
+                print(
+                    f"[REG TREO][CANCEL] Reload {refresh_attempt}/3 warning "
+                    f"for {user}: {exc}"
+                )
+            page.wait_for_timeout(2000)
+
+            already_cancelled, evidence = cancellation_visible(page)
+            if already_cancelled:
+                if context is not None:
+                    context["subscription_cancelled"] = True
+                    context["cancellation_evidence"] = evidence
+                return True
+            if open_plan_manager(page):
+                plan_manager_opened = True
+                print(
+                    f"[REG TREO][CANCEL] Pro plan manager found after reload "
+                    f"{refresh_attempt}/3: {user}"
+                )
+                break
+            print(
+                f"[REG TREO][CANCEL] Pro/cancellation control not ready after "
+                f"reload {refresh_attempt}/3; retrying in 2 seconds: {user}"
+            )
+
+        if not plan_manager_opened:
+            detail = f"; reload warnings: {' | '.join(refresh_errors)}" if refresh_errors else ""
+            raise RuntimeError(
+                f"Could not open CapCut auto-renewal manager after 3 reloads{detail}"
+            )
+        already_cancelled, evidence = cancellation_visible(page)
+        if already_cancelled:
+            if context is not None:
+                context["subscription_cancelled"] = True
+                context["cancellation_evidence"] = evidence
+            return True
+
+        cancel_clicked = (
+            click_exact_dom_text(
+                page,
+                (
+                    "Cancel subscription",
+                    "Cancel plan",
+                    "Turn off auto-renewal",
+                    "Hủy gói đăng ký",
+                    "Huỷ gói đăng ký",
+                ),
+            )
+            or click_matching_control(page, cancel_pattern)
+        )
+        if not cancel_clicked:
+            # The current subscription modal paints this small action through
+            # a framework layer that exposes text in body.innerText but no
+            # clickable DOM/accessibility node. Use its stable position only
+            # after positively identifying the manager and its active fields.
+            try:
+                viewport = page.evaluate("() => ({width: innerWidth, height: innerHeight})")
+                page.mouse.click(
+                    int(viewport["width"] * 0.573),
+                    int(viewport["height"] * 0.501),
+                )
+                cancel_clicked = True
+            except Exception as exc:
+                raise RuntimeError(f"Could not click subscription modal action: {exc}") from exc
+        if not cancel_clicked:
+            raise RuntimeError("Cancel subscription control was not visible")
+        print(f"[REG TREO][CANCEL] Cancellation started for {user}")
+        page.wait_for_timeout(700)
+
+        reason_selected = False
+        for _ in range(12):
+            cancelled, evidence = cancellation_visible(page)
+            if cancelled:
+                if context is not None:
+                    context["subscription_cancelled"] = True
+                    context["cancellation_evidence"] = evidence
+                print(f"[REG TREO][CANCEL] Subscription cancelled for {user}: {evidence}")
+                return True
+
+            if not reason_selected:
+                reason_options = page.locator(
+                    '[role="radio"], input[type="radio"], [class*="reason" i] [role="option"]'
+                )
+                if click_first(reason_options, timeout=1200):
+                    reason_selected = True
+                    page.wait_for_timeout(300)
+
+            confirmation_clicked = click_exact_dom_text(
+                page,
+                (
+                    "Cancel auto-renewal",
+                    "Confirm cancellation",
+                    "Continue to cancel",
+                    "Cancel anyway",
+                    "Yes, cancel",
+                ),
+            ) or click_matching_control(page, confirm_pattern)
+            if not confirmation_clicked:
+                confirmation_text = body_text(page).casefold()
+                if (
+                    "cancel auto-renewal?" in confirmation_text
+                    and "not now" in confirmation_text
+                    and "cancel auto-renewal" in confirmation_text
+                ):
+                    try:
+                        viewport = page.evaluate("() => ({width: innerWidth, height: innerHeight})")
+                        page.mouse.click(
+                            int(viewport["width"] * 0.571),
+                            int(viewport["height"] * 0.746),
+                        )
+                        confirmation_clicked = True
+                    except Exception:
+                        pass
+            if confirmation_clicked:
+                page.wait_for_timeout(800)
+                continue
+            page.wait_for_timeout(500)
+
+        # Re-open the manager once; some CapCut versions close the confirmation
+        # dialog and only expose "Expires on" in a freshly rendered card.
+        open_profile_menu(page)
+        open_plan_manager(page)
+        cancelled, evidence = cancellation_visible(page)
+        if cancelled:
+            if context is not None:
+                context["subscription_cancelled"] = True
+                context["cancellation_evidence"] = evidence
+            print(f"[REG TREO][CANCEL] Subscription cancelled for {user}: {evidence}")
+            return True
+        if context is not None:
+            context["subscription_cancelled"] = False
+        raise RuntimeError("CapCut did not confirm that auto-renewal was disabled")
+
+
 def patch_hold_proxy(namespace, registration_workflow=None):
-    """Patch proxy handling and use the modern workflow only in hold mode."""
+    """Patch proxy handling and use the modern registration flow in both modes."""
     app_class = namespace["RegCapCutApp"]
     original_init = app_class.__init__
     original_proxy_for_worker = app_class.proxy_for_worker
+    original_run_worker = getattr(app_class, "run_worker", None)
+    write_result = namespace.get("write_result", lambda *_args, **_kwargs: None)
+    oauth_export_line = namespace.get(
+        "oauth_export_line",
+        lambda account: account.get("api")
+        or f"{account.get('user', '')}|{account.get('passnew', '')}",
+    )
+    workflow_interrupted = namespace.get("CapCutWorkflowInterrupted", RuntimeError)
     signup_url = namespace["CAPCUT_SIGN_UP_URL"]
     resolve_window_layout = sys.modules["core.settings"].resolve_browser_window_layout
 
+    def write_cancelled_result(account, export_lock, export_dir="export"):
+        target = Path(export_dir) / "cancelled.txt"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with export_lock:
+            with target.open("a", encoding="utf-8") as file:
+                file.write(str(oauth_export_line(account)).rstrip("\r\n") + "\n")
+                file.flush()
+        return target
+
+    def write_unpaid_result(account, export_lock, export_dir="export"):
+        target = Path(export_dir) / "chua_pay.txt"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with export_lock:
+            with target.open("a", encoding="utf-8") as file:
+                file.write(str(oauth_export_line(account)).rstrip("\r\n") + "\n")
+                file.flush()
+        return target
+
+    def wait_until_browser_closed(process, user, stop_event, reason="UNPAID"):
+        """Wait only for the user's Chrome X, then immediately release the worker."""
+        reason_label = str(reason or "HOLD").upper()
+        print(
+            f"[REG TREO][{reason_label}] Waiting for user to close Chrome for {user}; "
+            "the next account will start immediately after the window closes"
+        )
+        while process is not None and process.poll() is None:
+            if stop_event.is_set():
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
+                return False
+            time.sleep(0.5)
+        print(
+            f"[REG TREO][{reason_label}] Chrome closed by user; "
+            f"advancing queue: {user}"
+        )
+        return True
+
+    def toggle_pause(self):
+        task = getattr(self, "task_thread", None)
+        if task is None or not task.is_alive():
+            print("No Reg CapCut workflow is running")
+            return False
+        if self.stop_event.is_paused():
+            self.stop_event.resume()
+            button_text = "Tạm dừng"
+            button_color = "#f59e0b"
+            active_color = "#d97706"
+            print("Reg CapCut workflow resumed")
+        else:
+            self.stop_event.pause()
+            button_text = "Tiếp tục"
+            button_color = "#2563eb"
+            active_color = "#1d4ed8"
+            print("Reg CapCut workflow paused")
+        pause_button = getattr(self, "pause_button", None)
+        if pause_button is not None:
+            pause_button.configure(
+                text=button_text,
+                bg=button_color,
+                activebackground=active_color,
+            )
+        return self.stop_event.is_paused()
+
     def versioned_init(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
+        if not hasattr(self, "active_standalone_processes"):
+            self.active_standalone_processes = {}
+        if not isinstance(getattr(self, "stop_event", None), PauseAwareEvent):
+            self.pause_event = threading.Event()
+            self.stop_event = PauseAwareEvent(
+                getattr(self, "stop_event", None),
+                self.pause_event,
+            )
+        else:
+            self.pause_event = self.stop_event._pause_event
         # A packaged release carries Chrome 154 under PyInstaller's resource
         # directory. Prefer it so the portable folder does not depend on the
         # absolute path used on the build machine.
         bundled_chromium = resource_root() / "chrome-154"
         adjacent_chromium = application_root() / "chrome-154"
-        for chromium_candidate in (bundled_chromium, adjacent_chromium):
+        collected_chromium = application_root() / "_internal" / "chrome-154"
+        for chromium_candidate in (
+            bundled_chromium,
+            adjacent_chromium,
+            collected_chromium,
+        ):
             if (chromium_candidate / "chrome.exe").is_file():
                 self.app_settings.chromium_path = str(chromium_candidate)
                 break
         root = args[0] if args else kwargs.get("root", getattr(self, "root", None))
+        self.browser_choice = _read_browser_choice()
+        # "Chrome máy" must mean the installed Google Chrome, not another
+        # Chromium path that happened to be stored in the legacy settings.
+        self._machine_chrome_path = _find_system_chrome()
         try:
             if root is not None:
                 root.title(f"Reg CapCut v{LEGACY_PATCH_VERSION}")
         except Exception:
             pass
 
+        # Add one mutually-exclusive Chrome selector to the registration bar
+        # shared by both Reg thuong and Reg treo.
+        try:
+            tk = namespace["tk"]
+
+            def descendants(widget):
+                for child in widget.winfo_children():
+                    yield child
+                    yield from descendants(child)
+
+            registration_bar = None
+            stop_button = None
+            for widget in descendants(root):
+                children = widget.winfo_children()
+                labels = set()
+                candidate_stop_button = None
+                for child in children:
+                    try:
+                        child_label = str(child.cget("text")).strip().lower()
+                        labels.add(child_label)
+                        if child_label == "stop":
+                            candidate_stop_button = child
+                    except Exception:
+                        continue
+                if "reg treo" in labels and any(label.startswith("reg th") for label in labels):
+                    registration_bar = widget
+                    stop_button = candidate_stop_button
+                    break
+
+            if registration_bar is not None:
+                self.browser_choice_var = tk.StringVar(master=root, value=self.browser_choice)
+
+                def save_browser_choice():
+                    selected = self.browser_choice_var.get()
+                    self.browser_choice = selected
+                    _write_browser_choice(selected)
+                    label = "Chrome 154" if selected == _BROWSER_CHOICE_BUNDLED else "Chrome máy"
+                    print(f"[BROWSER] Selected {label} for Reg thường and Reg treo")
+
+                radio_options = (
+                    ("Chrome 154", _BROWSER_CHOICE_BUNDLED),
+                    ("Chrome máy", _BROWSER_CHOICE_SYSTEM),
+                )
+                self.browser_choice_buttons = []
+                for label, value in radio_options:
+                    button = tk.Radiobutton(
+                        registration_bar,
+                        text=label,
+                        variable=self.browser_choice_var,
+                        value=value,
+                        command=save_browser_choice,
+                        bg="#ffffff",
+                        activebackground="#ffffff",
+                        selectcolor="#ffffff",
+                        takefocus=False,
+                        padx=2,
+                    )
+                    button.pack(side="left", padx=(5, 0), pady=6)
+                    self.browser_choice_buttons.append(button)
+
+                self.pause_button = tk.Button(
+                    registration_bar,
+                    text="Tạm dừng",
+                    command=self.toggle_pause,
+                    bg="#f59e0b",
+                    fg="#ffffff",
+                    activebackground="#d97706",
+                    activeforeground="#ffffff",
+                    relief="solid",
+                    borderwidth=1,
+                    takefocus=False,
+                    padx=8,
+                )
+                pause_pack = {
+                    "side": "left",
+                    "padx": (5, 0),
+                    "pady": 6,
+                }
+                if stop_button is not None:
+                    pause_pack["before"] = stop_button
+                self.pause_button.pack(**pause_pack)
+        except Exception as exc:
+            print(f"[BROWSER] Could not add Chrome selector: {exc}")
+
+    def stop(self):
+        """Stop workers and close every standalone registration browser now."""
+        task = getattr(self, "task_thread", None)
+        if task is None or not task.is_alive():
+            print("No Reg CapCut workflow is running")
+            return
+        self.stop_event.set()
+        pause_button = getattr(self, "pause_button", None)
+        if pause_button is not None:
+            try:
+                pause_button.configure(
+                    text="Tạm dừng",
+                    bg="#f59e0b",
+                    activebackground="#d97706",
+                )
+            except Exception:
+                pass
+        lock = getattr(self, "active_profiles_lock", None)
+        if lock is None:
+            standalone_to_close = list(
+                getattr(self, "active_standalone_processes", {}).items()
+            )
+        else:
+            with lock:
+                standalone_to_close = list(
+                    getattr(self, "active_standalone_processes", {}).items()
+                )
+        for user, process in standalone_to_close:
+            try:
+                if process is not None and process.poll() is None:
+                    process.terminate()
+                print(f"Stop closed registration Chrome: {user}")
+            except Exception as exc:
+                print(f"Stop Chrome warning for {user}: {exc}")
+        print("Stop requested; waiting for workers to finish")
+
     def proxy_for_worker(self, index, max_threads):
         proxy = original_proxy_for_worker(self, index, max_threads)
-        if getattr(self, "hold_mode", False):
-            account = self.current_accounts[index]
-            active_windows = max(1, min(max_threads, len(self.current_accounts)))
-            account[_WINDOW_SLOT_KEY] = index % active_windows
-            account[_WINDOW_TOTAL_KEY] = active_windows
-            if not str(account.get("passnew", "") or "").strip():
-                fallback_password = str(account.get("passmail", "") or account.get("pass", "") or "").strip()
-                if fallback_password:
-                    account["passnew"] = fallback_password
+        account = self.current_accounts[index]
+        active_windows = max(1, min(max_threads, len(self.current_accounts)))
+        account[_WINDOW_SLOT_KEY] = index % active_windows
+        account[_WINDOW_TOTAL_KEY] = active_windows
+        if not str(account.get("passnew", "") or "").strip():
+            fallback_password = str(account.get("passmail", "") or account.get("pass", "") or "").strip()
+            if fallback_password:
+                account["passnew"] = fallback_password
+                if getattr(self, "hold_mode", False):
                     print(f"[REG TREO] Using the supplied account password for CapCut registration: {account['user']}")
-            # Keep the selection pending.  Do not request/activate the proxy
-            # until the original registration workflow reports success.
-            account[_PENDING_PROXY_KEY] = proxy
+                else:
+                    print(f"[REG THUONG] Using the supplied account password for CapCut registration: {account['user']}")
+        # Reg treo activates this upstream only after registration. Reg thuong
+        # activates it before launch, matching its original proxy behavior.
+        account[_PENDING_PROXY_KEY] = proxy
         return proxy
 
     def start_standalone_chromium(self, account, index):
-        configured = Path(str(self.app_settings.chromium_path).strip().strip('"'))
-        browser = configured / "chrome.exe" if configured.is_dir() else configured
-        if not browser.is_file():
-            raise RuntimeError(f"Chromium khong ton tai: {browser}")
+        browser_choice = getattr(self, "browser_choice", _BROWSER_CHOICE_BUNDLED)
+        if browser_choice == _BROWSER_CHOICE_SYSTEM:
+            browser = _find_system_chrome(getattr(self, "_machine_chrome_path", None))
+            if browser is None:
+                raise RuntimeError(
+                    "Khong tim thay Google Chrome tren may. Hay cai Chrome hoac chon Chrome 154."
+                )
+            browser_label = "Chrome máy"
+        else:
+            browser = _chrome_executable(getattr(self.app_settings, "chromium_path", ""))
+            if browser is None:
+                for chromium_candidate in (
+                    resource_root() / "chrome-154",
+                    application_root() / "chrome-154",
+                    application_root() / "_internal" / "chrome-154",
+                ):
+                    browser = _chrome_executable(chromium_candidate)
+                    if browser is not None:
+                        break
+            if browser is None:
+                raise RuntimeError("Chrome 154 khong ton tai trong thu muc chuong trinh")
+            browser_label = "Chrome 154"
+        print(f"[BROWSER] Launching {browser_label}: {browser}")
 
         listener = socket.socket()
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
         listener.close()
 
-        profile_dir = Path("reg treo") / "chromium_profiles" / str(index + 1)
+        hold_mode = bool(getattr(self, "hold_mode", False))
+        profile_root = "reg treo" if hold_mode else "reg thuong"
+        profile_dir = Path(profile_root) / "chromium_profiles" / str(index + 1)
         profile_dir.mkdir(parents=True, exist_ok=True)
         pending_proxy = account.pop(_PENDING_PROXY_KEY, None)
         window_slot = int(account.pop(_WINDOW_SLOT_KEY, 0))
@@ -1583,6 +2748,14 @@ def patch_hold_proxy(namespace, registration_workflow=None):
         )
         thuecloud_enabled = bool(getattr(getattr(self.app_settings, "thuecloud", None), "enabled", False))
         relay = DeferredProxyRelay() if pending_proxy is not None or thuecloud_enabled else None
+        if relay is not None and not hold_mode:
+            raw_proxy = self.get_account_raw_proxy(account, pending_proxy)
+            upstream = parse_proxy(raw_proxy)
+            if upstream is None:
+                relay.close()
+                raise RuntimeError("Proxy rong cho Reg thuong")
+            relay.activate(upstream)
+            print(f"[REG THUONG] Activated registration proxy for {account['user']}: {upstream['server']}")
         args = [
             str(browser),
             f"--remote-debugging-port={port}",
@@ -1646,8 +2819,8 @@ def patch_hold_proxy(namespace, registration_workflow=None):
             incognito=True,
             reuse_startup_context=True,
             proxy=None,
-            reg_treo=True,
-            activate_proxy=activate_proxy if relay else None,
+            reg_treo=hold_mode,
+            activate_proxy=activate_proxy if relay and hold_mode else None,
         )
         return RelayProcess(process, relay) if relay else process, start_result
 
@@ -1656,21 +2829,27 @@ def patch_hold_proxy(namespace, registration_workflow=None):
 
     def run_capcut_workflow(account=None, context=None):
         start_result = (context or {}).get("start_result")
-        selected_workflow = (
-            modern_workflow
-            if getattr(start_result, "reg_treo", False)
-            else original_workflow
-        )
-        result = selected_workflow(account, context)
-        if result:
+        is_reg_treo = bool(getattr(start_result, "reg_treo", False))
+        # Reg thuong uses the same resilient birthday/OTP/login workflow as
+        # Reg treo. Only Reg treo continues into proxy activation, checkout,
+        # and browser hold; Reg thuong returns immediately after account ready.
+        if context is not None:
+            context["allow_existing_login"] = True
+        result = modern_workflow(account, context)
+        if result and is_reg_treo:
             activate_proxy = getattr(start_result, "activate_proxy", None)
             if activate_proxy:
                 activate_proxy()
             try:
-                open_pro_checkout_across_five_tabs(account, context, selected_workflow)
+                checkout_paid = bool(
+                    open_pro_checkout_across_five_tabs(account, context, modern_workflow)
+                )
                 if context is not None:
-                    context["checkout_success"] = True
-                    context.pop("checkout_error", None)
+                    context["checkout_success"] = checkout_paid
+                    if checkout_paid:
+                        context.pop("checkout_error", None)
+                    else:
+                        context["checkout_error"] = "payment was not confirmed"
             except Exception as exc:
                 # Registration is already complete.  Preserve the successful
                 # result and hold Chrome so the user can finish manually.
@@ -1679,14 +2858,174 @@ def patch_hold_proxy(namespace, registration_workflow=None):
                     context["checkout_success"] = False
                     context["checkout_error"] = safe_error
                 print(f"[REG TREO][PRO] Automatic Pro checkout warning for {account['user']}: {safe_error}")
+        elif result:
+            print(
+                f"[REG THUONG] Account ready for {account['user']}; "
+                "finishing this task and continuing the queue"
+            )
         return result
 
     run_capcut_workflow.__wrapped__ = original_workflow
     run_capcut_workflow.__reg_treo_workflow__ = modern_workflow
 
+    def run_worker(self, account, group_name, index, total, semaphore, max_threads):
+        """Run both buttons through standalone incognito Chromium 154."""
+        with semaphore:
+            standalone_process = None
+            hold_mode = bool(getattr(self, "hold_mode", False))
+            workflow_context = None
+            try:
+                if self.stop_event.is_set():
+                    self.mark_account_status(account, "stopped")
+                    return
+                self.mark_account_status(account, "running")
+                self.proxy_for_worker(index, max_threads)
+                standalone_process, start_result = self._start_standalone_chromium(account, index)
+                with self.active_profiles_lock:
+                    if not hasattr(self, "active_standalone_processes"):
+                        self.active_standalone_processes = {}
+                    self.active_standalone_processes[account["user"]] = standalone_process
+                mode_label = "REG TREO" if hold_mode else "REG THUONG"
+                print(f"[{mode_label}] Started Chromium standalone for {account['user']}")
+                if self.stop_event.is_set():
+                    self.mark_account_status(account, "stopped")
+                    return
+
+                workflow_context = {
+                    "start_result": start_result,
+                    "stop_event": self.stop_event,
+                    "on_login_blocked": self._request_expressvpn_reset,
+                }
+                workflow_ok = bool(run_capcut_workflow(account, workflow_context))
+                if self.stop_event.is_set():
+                    self.mark_account_status(account, "stopped")
+                    return
+                payment_confirmed = bool(
+                    workflow_context and workflow_context.get("payment_confirmed")
+                )
+                account_success = workflow_ok and (not hold_mode or payment_confirmed)
+                if account_success:
+                    self.mark_account_status(account, "Đã pay" if hold_mode else "true")
+                    write_result(account, True, self.export_lock)
+                    self.queue_sheet_success(account)
+                    if hold_mode:
+                        print(
+                            f"[REG TREO][PAYMENT] Paid account saved; starting "
+                            f"subscription cancellation: {account['user']}"
+                        )
+                        try:
+                            cancelled = bool(
+                                cancel_capcut_subscription(
+                                    account,
+                                    workflow_context,
+                                    modern_workflow,
+                                )
+                            )
+                            if not cancelled:
+                                raise RuntimeError(
+                                    "CapCut cancellation returned without confirmation"
+                                )
+                            self.write_cancelled_result(account, self.export_lock)
+                            self.mark_account_status(account, "Đã pay - Đã huỷ gói")
+                            print(
+                                f"[REG TREO][CANCEL] Cancelled account saved; "
+                                f"advancing to next account: {account['user']}"
+                            )
+                        except Exception as exc:
+                            safe_error = str(exc).encode("ascii", "replace").decode("ascii")
+                            if workflow_context is not None:
+                                workflow_context["subscription_cancelled"] = False
+                                workflow_context["cancellation_error"] = safe_error
+                                workflow_context["cancellation_pending"] = True
+                            self.mark_account_status(account, "Đã pay - Chưa huỷ gói")
+                            print(
+                                f"[REG TREO][CANCEL] Paid account remains exported but "
+                                f"cancellation was not confirmed for {account['user']}: "
+                                f"{safe_error}"
+                            )
+                            wait_until_browser_closed(
+                                standalone_process,
+                                account["user"],
+                                self.stop_event,
+                                reason="CANCEL",
+                            )
+                    else:
+                        print(f"Success: {account['user']}")
+                elif workflow_ok and hold_mode:
+                    checkout_tab_closed = bool(
+                        workflow_context and workflow_context.get("checkout_tab_closed")
+                    )
+                    self.mark_account_status(account, "Chưa pay")
+                    self.write_unpaid_result(account, self.export_lock)
+                    print(
+                        f"[REG TREO][PAYMENT] Account was registered but payment was "
+                        f"not confirmed; unpaid account saved: {account['user']}"
+                    )
+                    if not checkout_tab_closed:
+                        wait_until_browser_closed(
+                            standalone_process,
+                            account["user"],
+                            self.stop_event,
+                        )
+                else:
+                    self.mark_account_status(account, "change fail")
+                    write_result(account, False, self.export_lock)
+                    print(f"Change failed: {account['user']}")
+            except workflow_interrupted as exc:
+                self.mark_account_status(account, "stopped")
+                print(f"Workflow stopped: {account['user']} - {exc}")
+            except Exception as exc:
+                if self.stop_event.is_set():
+                    self.mark_account_status(account, "stopped")
+                    print(f"Workflow stopped: {account['user']} - {exc}")
+                    return
+                error_text = str(exc).lower()
+                if any(marker in error_text for marker in ("login", "password", "email step", "sign up")):
+                    self._request_expressvpn_reset()
+                self.mark_account_status(account, f"change fail: {exc}")
+                write_result(account, False, self.export_lock)
+                print(f"Error: {account['user']} - {exc}")
+            finally:
+                with self.active_profiles_lock:
+                    self.active_profiles.pop(account["user"], None)
+                    getattr(self, "active_standalone_processes", {}).pop(
+                        account["user"], None
+                    )
+                if (
+                    standalone_process is not None
+                    and standalone_process.poll() is None
+                    and (
+                        self.stop_event.is_set()
+                        or
+                        not hold_mode
+                        or bool(
+                            workflow_context
+                            and (
+                                workflow_context.get("checkout_tab_closed")
+                                or workflow_context.get("subscription_cancelled")
+                                or (
+                                    workflow_context.get("payment_confirmed")
+                                    and not workflow_context.get("cancellation_pending")
+                                )
+                            )
+                        )
+                    )
+                ):
+                    standalone_process.terminate()
+                    mode_label = "REG TREO" if hold_mode else "REG THUONG"
+                    print(f"[{mode_label}] Closed Chromium after account task: {account['user']}")
+
+    if original_run_worker is not None:
+        run_worker.__wrapped__ = original_run_worker
+
     app_class.proxy_for_worker = proxy_for_worker
     app_class.__init__ = versioned_init
+    app_class.toggle_pause = toggle_pause
+    app_class.stop = stop
     app_class._start_standalone_chromium = start_standalone_chromium
+    app_class.write_cancelled_result = staticmethod(write_cancelled_result)
+    app_class.write_unpaid_result = staticmethod(write_unpaid_result)
+    app_class.run_worker = run_worker
     namespace["run_capcut_workflow"] = run_capcut_workflow
     return app_class
 
@@ -1707,7 +3046,7 @@ def main():
         modern_source = getattr(workflow, "__reg_treo_workflow__", workflow).__code__.co_filename
         print(
             f"regcapcut v{LEGACY_PATCH_VERSION} loaded; legacy={legacy_source}; "
-            f"reg_treo={modern_source}"
+            f"registration={modern_source}"
         )
         return
     namespace["main"]()

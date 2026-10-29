@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 import time
 from urllib import error, request
 
@@ -194,7 +195,7 @@ def _oauth2_payload(account: dict) -> dict[str, str]:
     }
 
 
-def _get_messages(account: dict) -> list[dict]:
+def _get_messages(account: dict, timeout: float = 30.0) -> list[dict]:
     payload = json.dumps(_oauth2_payload(account)).encode("utf-8")
     http_request = request.Request(
         OAUTH2_MESSAGES_URL,
@@ -207,15 +208,30 @@ def _get_messages(account: dict) -> list[dict]:
         method="POST",
     )
     try:
-        with request.urlopen(http_request, timeout=30) as response:
+        with request.urlopen(http_request, timeout=timeout) as response:
             result = json.loads(response.read().decode("utf-8"))
     except error.HTTPError as exc:
         raise RuntimeError(f"CapCut mailbox request failed: HTTP {exc.code}") from exc
-    except (error.URLError, json.JSONDecodeError) as exc:
+    except (error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"CapCut mailbox request failed: {exc}") from exc
     if not result.get("status"):
-        raise RuntimeError("CapCut mailbox API returned false status")
-    return result.get("messages") or []
+        detail = next(
+            (
+                str(result.get(key)).strip()
+                for key in ("error", "message", "msg", "reason")
+                if result.get(key)
+            ),
+            "",
+        )
+        safe_detail = detail.encode("ascii", "backslashreplace").decode("ascii")
+        suffix = f": {safe_detail}" if safe_detail else ""
+        raise RuntimeError(f"CapCut mailbox API returned false status{suffix}")
+    messages = result.get("messages")
+    if messages is None:
+        return []
+    if not isinstance(messages, list):
+        raise RuntimeError("CapCut mailbox API returned an invalid messages list")
+    return messages
 
 
 def _extract_capcut_code(messages: list[dict], excluded: set[str]) -> str | None:
@@ -267,7 +283,10 @@ def _wait_for_resent_capcut_code(
         attempt += 1
         try:
             print(f"[CAPCUT][OTP] Resend poll {attempt} for {user}")
-            messages = _get_messages(account)
+            # Keep mailbox requests short so several concurrent signup
+            # windows cannot freeze the OTP screen for 30 seconds at a time.
+            remaining = max(1.0, deadline - time.time())
+            messages = _get_messages(account, timeout=min(5.0, remaining))
             new_messages = []
             for message in messages:
                 serialized = json.dumps(message, sort_keys=True, ensure_ascii=False, default=str)
@@ -304,7 +323,11 @@ def _wait_for_capcut_code(
         attempt += 1
         try:
             print(f"[CAPCUT][OTP] Poll {attempt} for {user}")
-            code = _extract_capcut_code(_get_messages(account), excluded)
+            remaining = max(1.0, deadline - time.time())
+            code = _extract_capcut_code(
+                _get_messages(account, timeout=min(5.0, remaining)),
+                excluded,
+            )
             if code:
                 print(f"[CAPCUT][OTP] Received verification code for {user}")
                 return code
@@ -324,23 +347,26 @@ def _resend_capcut_code(page, user: str, stop_event, timeout: float = 75.0) -> N
     print(f"[CAPCUT][OTP] Waiting for Resend to become available for {user}")
     deadline = time.time() + timeout
     last_error = None
+    # Match the control itself, not its large parent sentence. The current
+    # page renders lower-case "resend code" as a plain span without a role.
     resend_pattern = re.compile(
-        r"(?:resend|send\s+(?:the\s+)?code\s+again|send\s+again|"
+        r"^\s*(?:resend(?:\s+code)?|send\s+(?:the\s+)?code\s+again|send\s+again|"
         r"get\s+(?:a\s+)?new\s+code|request\s+(?:a\s+)?new\s+code|"
-        r"gá»­i\s+láº¡i|gá»­i\s+láº¡i\s+mÃ£)",
+        r"gá»­i\s+láº¡i|gá»­i\s+láº¡i\s+mÃ£)\s*$",
         re.IGNORECASE,
     )
+    last_wait_log = 0.0
     while time.time() <= deadline:
         _ensure_running(stop_event, user)
         candidates = (
             page.get_by_role("button", name=resend_pattern),
             page.get_by_role("link", name=resend_pattern),
             page.locator("button, [role='button'], a").filter(has_text=resend_pattern),
-            page.get_by_text(resend_pattern),
+            page.get_by_text(resend_pattern, exact=True),
         )
         for candidates_group in candidates:
             try:
-                count = candidates_group.count()
+                count = min(candidates_group.count(), 12)
             except Exception as exc:
                 last_error = exc
                 continue
@@ -365,11 +391,22 @@ def _resend_capcut_code(page, user: str, stop_event, timeout: float = 75.0) -> N
                             candidate = clickable
                     except Exception:
                         pass
-                    candidate.click(timeout=3000)
+                    try:
+                        candidate.click(timeout=800)
+                    except Exception:
+                        candidate.evaluate("element => element.click()", timeout=800)
                     print(f"[CAPCUT][OTP] Requested a new verification code for {user}")
                     return
                 except Exception as exc:
                     last_error = exc
+        now = time.time()
+        if now - last_wait_log >= 5.0:
+            remaining = max(0, int(deadline - now))
+            print(
+                f"[CAPCUT][OTP] Resend control not clickable yet for {user}; "
+                f"retrying ({remaining}s left)"
+            )
+            last_wait_log = now
         _wait(0.5, stop_event, user)
     raise RuntimeError(f"CapCut Resend did not become available for {user}: {last_error}") from last_error
 
@@ -406,7 +443,18 @@ def _get_capcut_code_with_resend(
     for resend_attempt in range(1, max_resends + 1):
         _ensure_running(stop_event, user)
         try:
-            previous_fingerprints = _capcut_message_fingerprints(_get_messages(account))
+            # Snapshotting is useful, but must not postpone a visible Resend
+            # control for the mailbox API's former 30-second timeout.
+            try:
+                previous_fingerprints = _capcut_message_fingerprints(
+                    _get_messages(account, timeout=3.0)
+                )
+            except RuntimeError as snapshot_error:
+                previous_fingerprints = set()
+                print(
+                    f"[CAPCUT][OTP] Resend mailbox snapshot skipped for {user}: "
+                    f"{snapshot_error}"
+                )
             print(
                 f"[CAPCUT][OTP] Resend attempt {resend_attempt}/{max_resends} "
                 f"for {user}"
@@ -447,7 +495,9 @@ def _force_resend_test(
     )
     _wait(initial_timeout, stop_event, user)
     try:
-        first_messages = _get_messages(account)
+        # This snapshot must not hold the visible resend control for the
+        # mailbox endpoint's normal 30-second timeout during an E2E run.
+        first_messages = _get_messages(account, timeout=3.0)
         previous_fingerprints = _capcut_message_fingerprints(first_messages)
         old_code = _extract_capcut_code(first_messages, set())
         if old_code:
@@ -539,7 +589,26 @@ def _birthday_continue_ready(page, timeout: float = 0.0) -> bool:
                 continue
         if time.time() >= deadline:
             return False
-        time.sleep(0.15)
+        time.sleep(0.05)
+
+
+def _start_mailbox_snapshot(account: dict) -> tuple[dict, threading.Thread]:
+    """Fetch pre-existing CapCut messages without delaying birthday Continue."""
+    state = {"ready": False, "fingerprints": None, "error": None}
+
+    def snapshot() -> None:
+        try:
+            state["fingerprints"] = _capcut_message_fingerprints(
+                _get_messages(account, timeout=3.0)
+            )
+        except Exception as exc:
+            state["error"] = exc
+        finally:
+            state["ready"] = True
+
+    worker = threading.Thread(target=snapshot, daemon=True, name="capcut-mailbox-snapshot")
+    worker.start()
+    return state, worker
 
 
 def _select_birthday(page, email: str) -> None:
@@ -1032,7 +1101,7 @@ def _login_existing_capcut_account(
 
 
 def run_capcut_workflow(account: dict | None = None, context: dict | None = None) -> bool:
-    """Register one CapCut account, or log it in during Reg treo if it exists."""
+    """Register one CapCut account, or log it in if it already exists."""
     if not account or not account.get("user"):
         raise RuntimeError("Missing CapCut account email")
     if not account.get("passnew"):
@@ -1043,8 +1112,12 @@ def run_capcut_workflow(account: dict | None = None, context: dict | None = None
     force_resend_test = bool((context or {}).get("force_resend_test")) or os.getenv(
         "REGCAPCUT_FORCE_RESEND_TEST", ""
     ).strip().lower() in {"1", "true", "yes", "on"}
+    resend_e2e_only = bool((context or {}).get("resend_e2e_only"))
     session = (context or {}).get("start_result")
-    allow_existing_login = bool(getattr(session, "reg_treo", False))
+    allow_existing_login = bool(
+        getattr(session, "reg_treo", False)
+        or (context or {}).get("allow_existing_login")
+    )
     using_proxy = bool(getattr(session, "proxy", None))
     signup_step_timeout = 120000 if using_proxy else 30000
     signup_click_timeout = 30000 if using_proxy else 10000
@@ -1124,35 +1197,25 @@ def run_capcut_workflow(account: dict | None = None, context: dict | None = None
                 _wait(0.25, stop_event, user)
         if visible_signup is not None:
             visible_signup.click(timeout=signup_click_timeout)
-        elif "/signup" in str(getattr(page, "url", "")).lower():
-            signup_submit = _first_visible_control(
-                page.locator('button[type="submit"]')
-            )
+        else:
+            # A slow CapCut render can temporarily remove the Sign-up button
+            # and change the URL before the birthday form is mounted. The old
+            # flow treated that transient state as an existing account and
+            # waited for Sign in until the worker closed Chrome. Submit the
+            # visible password form when possible, otherwise let the explicit
+            # birthday/login route detector below decide what actually loaded.
+            signup_submit = _first_visible_control(page.locator('button[type="submit"]'))
             if signup_submit is not None:
                 signup_submit.click(timeout=signup_click_timeout)
-            else:
+            elif "/signup" in str(getattr(page, "url", "")).lower():
                 password_input.press("Enter")
-        elif allow_existing_login:
-            _login_existing_capcut_account(
-                page,
-                account,
-                stop_event,
-                signup_step_timeout,
-                signup_click_timeout,
-            )
-            account["userID"] = extract_capcut_username(
-                page,
-                user,
-                stop_event,
-                dismiss_popups=dismiss_capcut_onboarding,
-            )
-            print(f"[CAPCUT][RESULT] Existing user for {user}: {account['userID'] or 'not found'}")
-            on_registered = (context or {}).get("on_registered")
-            if on_registered is not None:
-                on_registered()
-            return True
-        else:
-            signup_button.click(timeout=signup_click_timeout)
+            elif allow_existing_login:
+                print(
+                    f"[CAPCUT][SIGNUP] Signup route still resolving after password: "
+                    f"{user} | url={page.url}"
+                )
+            else:
+                signup_button.click(timeout=signup_click_timeout)
 
         birthday_year = page.locator(
             'input[placeholder="Year"], input[placeholder="Năm"]'
@@ -1198,6 +1261,10 @@ def run_capcut_workflow(account: dict | None = None, context: dict | None = None
                     break
                 _wait(0.5, stop_event, user)
             if existing_account:
+                print(
+                    f"[CAPCUT][LOGIN] Explicit existing-account route detected: "
+                    f"{user} | url={page.url}"
+                )
                 if not _capcut_account_area_visible(page):
                     _login_existing_capcut_account(
                         page,
@@ -1219,22 +1286,42 @@ def run_capcut_workflow(account: dict | None = None, context: dict | None = None
                 return True
         birthday_year.wait_for(state="visible", timeout=signup_step_timeout)
         print(f"[CAPCUT][SIGNUP] Birthday form ready: {user} | url={page.url}")
+        # The mailbox API may take up to 30 seconds. Start the snapshot while
+        # the birthday controls are being filled so a completed form never
+        # sits idle waiting for this network request.
+        otp_snapshot, otp_snapshot_thread = _start_mailbox_snapshot(account)
         _select_birthday(page, user)
         continue_button = page.get_by_role("button", name="Continue", exact=True).or_(
             page.get_by_role("button", name="Tiếp tục", exact=True)
         )
-        continue_button.wait_for(state="visible", timeout=5000)
-        if not continue_button.is_enabled():
+        continue_button = _first_visible_control(continue_button)
+        if continue_button is None or not continue_button.is_enabled():
             raise RuntimeError(f"CapCut birthday form is incomplete for {user}")
-        # Snapshot prior CapCut messages before requesting this registration's
-        # OTP. This prevents an old six-digit code from an earlier run being
-        # submitted immediately and rejected as expired.
-        try:
-            otp_message_fingerprints = _capcut_message_fingerprints(_get_messages(account))
-        except Exception as exc:
+        # Use the pre-click snapshot only if it is already ready. Waiting more
+        # than 100 ms here would delay Continue and is not worth blocking the
+        # registration UI on a slow mailbox service.
+        otp_snapshot_thread.join(timeout=0.1)
+        if otp_snapshot["ready"] and otp_snapshot["error"] is None:
+            otp_message_fingerprints = otp_snapshot["fingerprints"]
+        else:
             otp_message_fingerprints = None
-            print(f"[CAPCUT][OTP] Could not snapshot existing mail for {user}: {exc}")
-        continue_button.click(timeout=signup_click_timeout)
+            if otp_snapshot["error"] is not None:
+                print(
+                    f"[CAPCUT][OTP] Could not snapshot existing mail for {user}: "
+                    f"{otp_snapshot['error']}"
+                )
+            else:
+                print(
+                    f"[CAPCUT][OTP] Mailbox snapshot still running for {user}; "
+                    "clicking birthday Continue without waiting"
+                )
+        try:
+            continue_button.click(timeout=2500)
+        except Exception:
+            try:
+                continue_button.click(timeout=1500, force=True)
+            except Exception:
+                continue_button.evaluate("element => element.click()", timeout=1000)
 
         _otp_inputs(page).first.wait_for(state="visible", timeout=signup_step_timeout)
         used_codes: set[str] = set()
@@ -1271,6 +1358,12 @@ def run_capcut_workflow(account: dict | None = None, context: dict | None = None
                     timeout=120.0,
                 )
             used_codes.add(code)
+            if resend_e2e_only:
+                print(
+                    f"[CAPCUT][OTP][TEST] Resent verification email confirmed for {user}; "
+                    "stopping before OTP entry"
+                )
+                return True
             print(
                 f"[CAPCUT][OTP] Filling code for {user} "
                 f"({attempt + 1}/{otp_fill_attempts})"
