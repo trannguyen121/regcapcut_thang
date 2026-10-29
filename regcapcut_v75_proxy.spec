@@ -43,7 +43,7 @@ exe = EXE(
     a.datas,
     [],
     exclude_binaries=False,
-    name='regcapcut_v7.5.507',
+    name='regcapcut_v7.5.508',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -61,5 +61,5 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name='regcapcut_v7.5.507',
+    name='regcapcut_v7.5.508',
 )

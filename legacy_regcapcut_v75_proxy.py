@@ -22,16 +22,82 @@ import zlib
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+from modules.ui.capcut_space_check import CheckSpaceMixin as CheckSpaceV103Mixin
+from modules.ui.reg_capcut_tab import RegCapCutApp as RegCapCutV103App
+
 
 LEGACY_ENTRY_NAME = "reg_capcut_tab.pyc"
 LEGACY_PYZ_NAME = "PYZ.pyz"
 MODERN_WORKFLOW_NAME = "capcut_workflow.py"
-LEGACY_PATCH_VERSION = "7.5.507"
+LEGACY_PATCH_VERSION = "7.5.508"
 _PENDING_PROXY_KEY = "_v75_pending_proxy"
 _WINDOW_SLOT_KEY = "_v75_window_slot"
 _WINDOW_TOTAL_KEY = "_v75_window_total"
 _BROWSER_CHOICE_BUNDLED = "chrome154"
 _BROWSER_CHOICE_SYSTEM = "system"
+
+# Only these v10.3 methods are grafted onto the v7.5 application. Registration,
+# checkout and Reg thuong/Reg treo methods deliberately remain the v7.5.508 ones.
+_ADD_LINK_V103_METHODS = {
+    "_add_link_account_status_text",
+    "_add_link_account_table_drag",
+    "_add_link_account_table_press",
+    "_add_link_table_drag",
+    "_add_link_table_press",
+    "_bind_space_to_tree",
+    "_capcut_status_text",
+    "_check_pro_status_text",
+    "_check_user_with_chromium_154",
+    "_entry_lost_focus",
+    "_read_add_link_account_state",
+    "_read_add_link_account_state_unlocked",
+    "_refresh_add_link_account_table",
+    "_refresh_add_link_table",
+    "_save_add_link_account_state",
+    "_save_add_link_workspace",
+    "_schedule_add_link_table_refresh",
+    "_select_all_table_rows",
+    "_set_all_add_link_accounts_selected",
+    "_set_all_links_selected",
+    "_sort_tree_column",
+    "_toggle_highlighted_add_link_accounts",
+    "_toggle_highlighted_links",
+    "append_add_link_account_result",
+    "append_check_pro_result",
+    "build_add_link_tab",
+    "build_check_pro_tab",
+    "delete_checked_add_link_accounts",
+    "delete_checked_links",
+    "export_checked_usernames",
+    "export_selected_add_link_accounts",
+    "import_add_link_accounts",
+    "import_add_link_links",
+    "import_check_pro_accounts",
+    "load_add_link_accounts",
+    "load_add_link_links",
+    "load_check_pro_accounts",
+    "refresh_add_link_status",
+    "refresh_check_pro_status",
+    "restore_add_link_workspace",
+    "run_add_link_accounts",
+    "run_add_link_worker",
+    "run_check_pro_accounts",
+    "run_check_pro_worker",
+    "run_check_user_accounts",
+    "run_check_user_worker",
+    "run_hold_accounts",
+    "run_hold_login_worker",
+    "show_add_link_statistics",
+    "start_add_link",
+    "start_add_link_two_slot",
+    "start_check_pro",
+    "start_check_pro_monthly",
+    "start_check_pro_yearly",
+    "start_check_user",
+    "start_hold_mode",
+    "write_add_link_results",
+    "_wait_for_hold_profile",
+}
 
 
 class PauseAwareEvent:
@@ -347,6 +413,46 @@ def load_legacy_namespace() -> dict:
     }
     exec(marshal.loads(path.read_bytes()), namespace)
     return namespace
+
+
+def remove_legacy_hold_tab(root) -> int:
+    """Remove the obsolete top-level ``Reg CapCut treo`` notebook page."""
+    if root is None:
+        return 0
+    removed = 0
+    pending = [root]
+    while pending:
+        widget = pending.pop()
+        try:
+            pending.extend(widget.winfo_children())
+        except Exception:
+            pass
+        if not all(hasattr(widget, name) for name in ("tabs", "tab", "forget")):
+            continue
+        try:
+            tab_ids = list(widget.tabs())
+        except Exception:
+            continue
+        for tab_id in tab_ids:
+            try:
+                label = str(widget.tab(tab_id, "text") or "").strip().casefold()
+            except Exception:
+                continue
+            if label != "reg capcut treo":
+                continue
+            child = None
+            try:
+                child = widget.nametowidget(tab_id)
+            except Exception:
+                pass
+            widget.forget(tab_id)
+            if child is not None:
+                try:
+                    child.destroy()
+                except Exception:
+                    pass
+            removed += 1
+    return removed
 
 
 def parse_proxy(raw_proxy: str) -> dict | None:
@@ -2463,6 +2569,52 @@ def patch_hold_proxy(namespace, registration_workflow=None):
     signup_url = namespace["CAPCUT_SIGN_UP_URL"]
     resolve_window_layout = sys.modules["core.settings"].resolve_browser_window_layout
 
+    # Replace only the Add Link surface with v10.3. Function objects retain
+    # their v10.3 globals/constants while the surrounding v7.5 app stays intact.
+    for method_name in _ADD_LINK_V103_METHODS:
+        # Read the raw descriptor so v10.3 @staticmethod methods do not become
+        # instance-bound when installed on the legacy class.
+        setattr(app_class, method_name, RegCapCutV103App.__dict__[method_name])
+    for method_name, method in CheckSpaceV103Mixin.__dict__.items():
+        if callable(method) and not method_name.startswith("__"):
+            setattr(app_class, method_name, method)
+
+    def start_add_link_account_browser_v103(
+        self,
+        account,
+        index,
+        max_threads,
+        startup_url=None,
+        reuse_startup_context=False,
+    ):
+        """Launch a v10.3 session without replacing the v7.5 Reg launcher."""
+        workflow_globals = RegCapCutV103App._start_account_browser.__globals__
+        target_url = startup_url or workflow_globals["CAPCUT_SIGN_UP_URL"]
+        return RegCapCutV103App._start_standalone_chromium(
+            self,
+            account,
+            index,
+            max_threads=max_threads,
+            startup_url=target_url,
+            reuse_startup_context=reuse_startup_context,
+        )
+
+    def start_add_link_browser_v103(self, account, index, max_threads):
+        workflow_globals = RegCapCutV103App._start_add_link_browser.__globals__
+        return start_add_link_account_browser_v103(
+            self,
+            account,
+            index,
+            max_threads,
+            startup_url=workflow_globals["CAPCUT_LOGIN_URL"],
+            reuse_startup_context=True,
+        )
+
+    app_class._start_account_browser = start_add_link_account_browser_v103
+    app_class._start_add_link_browser = start_add_link_browser_v103
+    app_class._close_standalone_process = RegCapCutV103App._close_standalone_process
+    app_class._resolve_chromium_154_browser = RegCapCutV103App._resolve_chromium_154_browser
+
     def write_cancelled_result(account, export_lock, export_dir="export"):
         target = Path(export_dir) / "cancelled.txt"
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -2529,6 +2681,14 @@ def patch_hold_proxy(namespace, registration_workflow=None):
         return self.stop_event.is_paused()
 
     def versioned_init(self, *args, **kwargs):
+        # v10.3 Add Link state is needed while the legacy __init__ builds the
+        # shared Notebook and calls the grafted build_add_link_tab method.
+        self.add_link_limits = {}
+        self.add_link_username_export_path = Path("check user") / "login_user.txt"
+        self.reg_username_export_path = Path("check user") / "reg_user.txt"
+        self.check_pro_yearly_path = Path("check gói") / "capcut_pro_yearly.txt"
+        self.check_pro_monthly_path = Path("check gói") / "capcut_pro_monthly.txt"
+        self.active_standalone_processes = {}
         original_init(self, *args, **kwargs)
         if not hasattr(self, "active_standalone_processes"):
             self.active_standalone_processes = {}
@@ -2555,6 +2715,9 @@ def patch_hold_proxy(namespace, registration_workflow=None):
                 self.app_settings.chromium_path = str(chromium_candidate)
                 break
         root = args[0] if args else kwargs.get("root", getattr(self, "root", None))
+        removed_hold_tabs = remove_legacy_hold_tab(root)
+        if removed_hold_tabs:
+            print("[GUI] Removed obsolete Reg CapCut treo tab")
         self.browser_choice = _read_browser_choice()
         # "Chrome máy" must mean the installed Google Chrome, not another
         # Chromium path that happened to be stored in the legacy settings.

@@ -12,10 +12,64 @@ import legacy_regcapcut_v75_proxy as legacy_patch
 
 
 class LegacyV75RegistrationPatchTests(unittest.TestCase):
-    def test_patch_version_is_75507(self):
-        self.assertEqual(legacy_patch.LEGACY_PATCH_VERSION, "7.5.507")
+    def test_patch_version_is_75508(self):
+        self.assertEqual(legacy_patch.LEGACY_PATCH_VERSION, "7.5.508")
         version_file = Path(__file__).resolve().parents[1] / "REGCAPCUT_V75_VERSION.txt"
-        self.assertEqual(version_file.read_text(encoding="utf-8").strip(), "7.5.507")
+        self.assertEqual(version_file.read_text(encoding="utf-8").strip(), "7.5.508")
+
+    def test_obsolete_reg_capcut_treo_notebook_tab_is_removed(self):
+        obsolete_child = Mock()
+        notebook = Mock()
+        notebook.winfo_children.return_value = []
+        notebook.tabs.return_value = ("normal", "links", "hold")
+        notebook.tab.side_effect = lambda tab_id, option: {
+            "normal": "Đăng ký CapCut",
+            "links": "Thêm link",
+            "hold": "Reg CapCut treo",
+        }[tab_id]
+        notebook.nametowidget.return_value = obsolete_child
+        root = Mock()
+        root.winfo_children.return_value = [notebook]
+        del root.tabs
+        del root.tab
+        del root.forget
+
+        removed = legacy_patch.remove_legacy_hold_tab(root)
+
+        self.assertEqual(removed, 1)
+        notebook.forget.assert_called_once_with("hold")
+        obsolete_child.destroy.assert_called_once_with()
+
+    def test_v103_add_link_is_grafted_without_replacing_registration(self):
+        class LegacyApp:
+            def proxy_for_worker(self, _index, _max_threads):
+                return None
+
+        namespace = {
+            "RegCapCutApp": LegacyApp,
+            "CAPCUT_SIGN_UP_URL": "https://www.capcut.com/signup",
+            "run_capcut_workflow": Mock(return_value=False),
+            "CapCutWorkflowInterrupted": RuntimeError,
+        }
+        settings_module = types.SimpleNamespace(resolve_browser_window_layout=Mock())
+        with patch.dict(sys.modules, {"core.settings": settings_module}):
+            legacy_patch.patch_hold_proxy(namespace, Mock(return_value=True))
+
+        self.assertIs(
+            LegacyApp.__dict__["build_add_link_tab"],
+            legacy_patch.RegCapCutV103App.__dict__["build_add_link_tab"],
+        )
+        self.assertIs(
+            LegacyApp.__dict__["start_add_link"],
+            legacy_patch.RegCapCutV103App.__dict__["start_add_link"],
+        )
+        self.assertNotIn("start", legacy_patch._ADD_LINK_V103_METHODS)
+        self.assertNotIn("run_worker", legacy_patch._ADD_LINK_V103_METHODS)
+        self.assertNotIn("_start_registration", legacy_patch._ADD_LINK_V103_METHODS)
+        self.assertIsNot(
+            LegacyApp.__dict__["run_worker"],
+            legacy_patch.RegCapCutV103App.__dict__["run_worker"],
+        )
 
     def test_only_explicit_22000_vnd_offer_is_accepted(self):
         accepted = ("22,000đ", "22000d", "₫22000", "22.000 VND")
