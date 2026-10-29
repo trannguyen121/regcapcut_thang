@@ -2,6 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import os
+import queue
+import struct
+import threading
 import time
 import unicodedata
 import subprocess
@@ -12,6 +17,15 @@ from pathlib import Path
 
 import requests
 
+
+# HMA's browser-extension native-messaging host. It speaks Chrome native
+# messaging (4-byte little-endian length + UTF-8 JSON) on stdin/stdout and
+# forwards {"action": ...} requests to the HMA VPN service.
+HMA_NATIVE_HOST = Path(
+    os.environ.get("ProgramFiles", r"C:\Program Files")
+) / "Privax" / "HMA VPN" / "VpnNM.exe"
+HMA_NATIVE_ORIGIN = "chrome-extension://poeojclicodamonabcabmapamjkkmnnk/"
+HMA_STATE_EVENT = "Vpn_OnStateChanged_SvcNm"
 
 HMA_WINDOW_TITLE = "HMA VPN"
 HMA_SWITCH_AUTOMATION_ID = "dashboard_switch"
@@ -149,19 +163,147 @@ def _reconnect_hma_once(disconnect_pause: float = 4.0) -> None:
     time.sleep(2)
 
 
-def reset_hma_ip() -> None:
-    """Disconnect HMA, wait four seconds, then reconnect once."""
-    print("[HMA] Resetting VPN connection", flush=True)
+class HmaNativeClient:
+    """Minimal client for HMA's native-messaging host (VpnNM.exe)."""
+
+    def __init__(self, executable: Path = HMA_NATIVE_HOST):
+        if not executable.exists():
+            raise RuntimeError(f"HMA native host not found: {executable}")
+        self._process = subprocess.Popen(
+            [str(executable), HMA_NATIVE_ORIGIN, "--parent-window=0"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        self._messages: queue.Queue = queue.Queue()
+        self._next_request_id = 0
+        threading.Thread(target=self._read_messages, daemon=True).start()
+
+    def __enter__(self) -> "HmaNativeClient":
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self._process.poll() is None:
+            self._process.kill()
+        self._process.wait(timeout=5)
+
+    def _read_messages(self) -> None:
+        stdout = self._process.stdout
+        while True:
+            header = stdout.read(4)
+            if len(header) < 4:
+                self._messages.put(None)
+                return
+            body = stdout.read(struct.unpack("<I", header)[0])
+            try:
+                self._messages.put(json.loads(body.decode("utf-8")))
+            except ValueError:
+                continue
+
+    def next_message(self, timeout: float):
+        """Return the next reply or event, or None when nothing arrived in time."""
+        try:
+            message = self._messages.get(timeout=max(timeout, 0.01))
+        except queue.Empty:
+            return None
+        if message is None:
+            raise RuntimeError("HMA native host exited unexpectedly")
+        return message
+
+    def request(self, action: str, timeout: float = 15.0, **params):
+        """Send one action and return its reply data; state events seen meanwhile are dropped."""
+        self._next_request_id += 1
+        request_id = str(self._next_request_id)
+        payload = json.dumps({"action": action, "requestId": request_id, **params}).encode("utf-8")
+        self._process.stdin.write(struct.pack("<I", len(payload)) + payload)
+        self._process.stdin.flush()
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            message = self.next_message(deadline - time.monotonic())
+            if message is None or message.get("requestId") != request_id:
+                continue
+            if message.get("error"):
+                raise RuntimeError(f"HMA {action} failed: {message['error']}")
+            return message.get("data")
+        raise RuntimeError(f"HMA {action} did not reply within {timeout:g} seconds")
+
+
+def _current_vpn_ip(public_ip_info) -> str:
+    return ((public_ip_info or {}).get("current") or {}).get("ip") or ""
+
+
+def reset_hma_ip_via_api(timeout: float = 45.0) -> str:
+    """Rotate the HMA IP through the VPN service and return the new public IP.
+
+    A connected VPN gets ShufflePublicIp (new IP, same server); a disconnected
+    one is connected to the optimal server first.
+    """
+    with HmaNativeClient() as client:
+        state = client.request("GetState")
+        status = state.get("vpnStatus")
+        old_ip = _current_vpn_ip(state.get("publicIpInfo")) if status == "connected" else ""
+        if status == "connected":
+            print(f"[HMA] Shuffling public IP (current {old_ip or 'unknown'})", flush=True)
+            client.request("ShufflePublicIp")
+        else:
+            print(f'[HMA] VPN is "{status}", connecting to the optimal server', flush=True)
+            client.request("ConnectToOptimal")
+
+        deadline = time.monotonic() + timeout
+        next_poll = time.monotonic() + 5
+        status = ""
+        while time.monotonic() < deadline:
+            # State events are partial updates; poll as well in case one is missed.
+            if time.monotonic() >= next_poll:
+                state = client.request("GetState")
+                next_poll = time.monotonic() + 5
+            else:
+                message = client.next_message(min(1.0, deadline - time.monotonic()))
+                if not message or message.get("action") != HMA_STATE_EVENT:
+                    continue
+                state = (message.get("data") or {}).get("data") or {}
+            status = state.get("vpnStatus") or status
+            new_ip = _current_vpn_ip(state.get("publicIpInfo"))
+            if status == "connected" and new_ip and new_ip != old_ip:
+                print(f"[HMA] New public IP: {new_ip}", flush=True)
+                return new_ip
+        raise RuntimeError(
+            f'HMA did not report a new IP within {timeout:g} seconds (last status: "{status}")'
+        )
+
+
+def reset_hma_ip_via_gui() -> None:
+    """Disconnect HMA, wait four seconds, then reconnect once by clicking its window."""
+    print("[HMA] Resetting VPN connection through the HMA window", flush=True)
     _reconnect_hma_once(disconnect_pause=4)
     print("[HMA] HMA reconnect command completed", flush=True)
 
 
+def reset_hma_ip() -> None:
+    """Rotate the HMA IP via the service API, falling back to clicking the window."""
+    try:
+        reset_hma_ip_via_api()
+    except Exception as exc:
+        print(f"[HMA] API reset failed ({exc}); falling back to the HMA window", flush=True)
+        reset_hma_ip_via_gui()
+
+
 def reset_hma_ip_safely(timeout: float = 60.0) -> None:
-    """Run HMA automation out of process so a stuck UIA call cannot freeze workers."""
+    """Rotate the HMA IP without letting a stuck UIA call freeze workers."""
+    try:
+        reset_hma_ip_via_api()
+        return
+    except Exception as exc:
+        print(f"[HMA] API reset failed ({exc}); falling back to the HMA window", flush=True)
+
     if getattr(sys, "frozen", False):
         # The standalone source runner is the supported PaySafe entry point.
         # Keep a functional fallback for a future frozen build.
-        reset_hma_ip()
+        reset_hma_ip_via_gui()
         return
 
     project_root = Path(__file__).resolve().parents[2]
@@ -189,6 +331,9 @@ def reset_hma_ip_safely(timeout: float = 60.0) -> None:
 
 
 if __name__ == "__main__":
-    if "--reset-worker" not in sys.argv:
-        raise SystemExit("Use --reset-worker")
-    reset_hma_ip()
+    if "--reset-worker" in sys.argv:
+        reset_hma_ip_via_gui()
+    elif "--reset" in sys.argv:
+        reset_hma_ip()
+    else:
+        raise SystemExit("Use --reset or --reset-worker")
